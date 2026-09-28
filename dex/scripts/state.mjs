@@ -1,0 +1,1244 @@
+#!/usr/bin/env node
+/**
+ * dex/scripts/state.mjs
+ *
+ * The Dex state machine and its command-line interface.
+ *
+ * This file owns every gate decision. Skills call it; they do not reimplement
+ * it in prose. If a rule can be checked here, it is checked here, because a
+ * model can forget an instruction and a program cannot.
+ *
+ * Usage:
+ *   node state.mjs init <slug> <title>
+ *   node state.mjs status <slug>
+ *   node state.mjs check <slug>                  (JSON gate report)
+ *   node state.mjs next <slug>
+ *   node state.mjs approve <slug> <questions|design|structure|code>
+ *   node state.mjs transition <slug> <event>
+ *   node state.mjs set-slices <slug> <S1:name> [S2:name ...]
+ *   node state.mjs start-slice <slug> <id>
+ *   node state.mjs finish-slice <slug> <id> [--note "..."]
+ *   node state.mjs block-slice <slug> <id> --reason "..."
+ *   node state.mjs verification <slug> <pass|fail> [--command "..." --exit N ...]
+ *   node state.mjs record-review <slug> <pass|remediation-required> [--blockers N]
+ *   node state.mjs record-worktree <slug> <branch> <path> [--base <ref>]
+ *   node state.mjs record-pr <slug> [--url <url>]
+ *   node state.mjs drift <slug> --reason "..." [--slice S2]
+ *   node state.mjs unblock <slug>
+ *   node state.mjs active [<slug>]
+ *   node state.mjs list
+ *   node state.mjs config
+ *   node state.mjs diff-hash [<slug>]
+ */
+
+import fs from 'node:fs'
+import path from 'node:path'
+import {
+  ARTIFACT_FILES,
+  DexError,
+  PHASES,
+  appendEvent,
+  artifactDir,
+  currentBranch,
+  detectBaseBranch,
+  diffFingerprint,
+  ensureConfig,
+  featureStateDir,
+  findRepoRoot,
+  hashFile,
+  isGitRepo,
+  listFeatures,
+  loadConfig,
+  loadFeatureState,
+  newFeatureState,
+  normalizeRelPath,
+  nowIso,
+  pad,
+  phaseIndex,
+  readActiveSlug,
+  readEvents,
+  resolveActiveFeature,
+  sanitizeSlug,
+  saveFeatureState,
+  withFeatureLock,
+  writeActiveSlug,
+} from './lib.mjs'
+
+// ---------------------------------------------------------------------------
+// Gate computation — the single source of truth
+// ---------------------------------------------------------------------------
+
+/** Status vocabulary used across status/next/guard so output stays predictable. */
+export const GATE = {
+  MISSING: 'MISSING',
+  PENDING: 'PENDING',
+  DRAFT: 'DRAFT',
+  COMPLETE: 'COMPLETE',
+  APPROVED: 'APPROVED',
+  STALE: 'STALE',
+  NOT_RUN: 'NOT-RUN',
+  PASS: 'PASS',
+  FAIL: 'FAIL',
+  READY: 'READY',
+  NOT_READY: 'NOT-READY',
+  NOT_REQUIRED: 'NOT-REQUIRED',
+  REQUIRED: 'REQUIRED',
+  BLOCKED: 'BLOCKED',
+  IN_PROGRESS: 'IN-PROGRESS',
+  CREATED: 'CREATED',
+  REMEDIATION: 'REMEDIATION-REQUIRED',
+}
+
+function artifactAbs(root, state, key) {
+  return path.join(root, state.artifacts[key])
+}
+
+function artifactExists(root, state, key) {
+  const p = artifactAbs(root, state, key)
+  try {
+    return fs.statSync(p).size > 0
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Evaluate one artifact-bound approval.
+ *
+ * An approval is a claim about a specific artifact's bytes. If the bytes moved,
+ * the claim is void: we report STALE rather than quietly honoring it.
+ */
+function approvalStatus(root, state, gateKey, artifactKey) {
+  const approval = state.approvals[gateKey]
+  const exists = artifactExists(root, state, artifactKey)
+  if (!exists) return { status: GATE.MISSING, stale: false, approved: false, reason: 'artifact does not exist' }
+  if (!approval || !approval.approved) {
+    return { status: GATE.DRAFT, stale: false, approved: false, reason: 'awaiting human approval' }
+  }
+  const current = hashFile(artifactAbs(root, state, artifactKey))
+  if (current !== approval.artifactHash) {
+    return {
+      status: GATE.STALE,
+      stale: true,
+      approved: false,
+      approvedHash: approval.artifactHash,
+      currentHash: current,
+      reason: `${artifactKey} changed after approval`,
+    }
+  }
+  return { status: GATE.APPROVED, stale: false, approved: true, approvedAt: approval.approvedAt, artifactHash: current }
+}
+
+/**
+ * Evaluate the human code approval, which binds to a diff fingerprint rather
+ * than a file. Recomputed from the working tree every time it is asked about.
+ */
+function codeApprovalStatus(root, config, state) {
+  const approval = state.approvals.humanCodeReview
+  if (!approval || !approval.approved) {
+    return { status: GATE.REQUIRED, stale: false, approved: false, reason: 'a human has not approved the production diff' }
+  }
+  const cwd = state.worktree?.path && fs.existsSync(state.worktree.path) ? state.worktree.path : root
+  const fp = diffFingerprint(cwd, approval.base ?? state.worktree?.base ?? null, config)
+  if (fp.hash !== approval.diffHash) {
+    return {
+      status: GATE.STALE,
+      stale: true,
+      approved: false,
+      approvedHash: approval.diffHash,
+      currentHash: fp.hash,
+      reason: 'the production diff changed after human approval',
+    }
+  }
+  return { status: GATE.APPROVED, stale: false, approved: true, approvedAt: approval.approvedAt, diffHash: fp.hash }
+}
+
+function sliceSummary(state) {
+  const slices = Array.isArray(state.slices) ? state.slices : []
+  const total = slices.length
+  const complete = slices.filter((s) => s.status === 'complete').length
+  const blocked = slices.filter((s) => s.status === 'blocked')
+  const inProgress = slices.filter((s) => s.status === 'in-progress')
+  const next = slices.find((s) => s.status === 'in-progress') || slices.find((s) => s.status === 'pending')
+  let status
+  if (total === 0) status = GATE.MISSING
+  else if (blocked.length) status = GATE.BLOCKED
+  else if (complete === total) status = GATE.COMPLETE
+  else if (complete > 0 || inProgress.length) status = GATE.IN_PROGRESS
+  else status = GATE.PENDING
+  return { status, total, complete, blocked: blocked.map((s) => s.id), next: next ? next.id : null, slices }
+}
+
+/**
+ * The complete gate report. Everything downstream — status output, `next`, the
+ * PreToolUse guard, the PR gate — reads this and nothing else.
+ */
+export function computeGates(root, config, state) {
+  const g = {}
+  g.intent = { status: artifactExists(root, state, 'intent') ? GATE.COMPLETE : GATE.MISSING }
+  g.questions = approvalStatus(root, state, 'questions', 'questions')
+  g.research = { status: artifactExists(root, state, 'research') ? GATE.COMPLETE : GATE.NOT_RUN }
+  g.design = approvalStatus(root, state, 'design', 'design')
+  g.structure = approvalStatus(root, state, 'structure', 'structure')
+  g.plan = { status: artifactExists(root, state, 'plan') ? GATE.COMPLETE : GATE.MISSING }
+
+  const wt = state.worktree || {}
+  if (!wt.required) g.worktree = { status: GATE.NOT_REQUIRED, ready: true }
+  else if (wt.ready && wt.path && fs.existsSync(wt.path)) g.worktree = { status: GATE.READY, ready: true, branch: wt.branch, path: wt.path }
+  else if (wt.ready) g.worktree = { status: GATE.NOT_READY, ready: false, reason: `recorded worktree path is gone: ${wt.path}` }
+  else g.worktree = { status: GATE.NOT_READY, ready: false, reason: 'no isolated worktree prepared' }
+
+  g.implementation = sliceSummary(state)
+
+  const v = state.verification || {}
+  g.verification = {
+    status: v.status === 'passed' ? GATE.PASS : v.status === 'failed' ? GATE.FAIL : GATE.NOT_RUN,
+    commands: v.commands || [],
+    ranAt: v.ranAt || null,
+  }
+
+  const r = state.aiReview || {}
+  if (!config.requireAiReview) {
+    g.aiReview = { status: GATE.NOT_REQUIRED, satisfied: true, blockers: 0 }
+  } else if (r.status === 'completed' && r.conclusion === 'pass') {
+    g.aiReview = { status: GATE.PASS, satisfied: true, blockers: r.blockers || 0 }
+  } else if (r.status === 'completed') {
+    g.aiReview = { status: GATE.REMEDIATION, satisfied: false, blockers: r.blockers || 0 }
+  } else {
+    g.aiReview = { status: GATE.NOT_RUN, satisfied: false, blockers: 0 }
+  }
+
+  g.humanCodeReview = config.requireHumanCodeApproval
+    ? codeApprovalStatus(root, config, state)
+    : { status: GATE.NOT_REQUIRED, approved: true, stale: false }
+
+  // --- Derived permissions -------------------------------------------------
+  // Fail closed: every reason to refuse is collected, and an empty list is the
+  // only thing that grants permission.
+
+  const implBlockers = []
+  if (!g.design.approved) implBlockers.push(`design is ${g.design.status} (${g.design.reason ?? ''})`.trim())
+  if (!g.structure.approved) implBlockers.push(`structure is ${g.structure.status} (${g.structure.reason ?? ''})`.trim())
+  if (g.plan.status !== GATE.COMPLETE) implBlockers.push('tactical plan (06-plan.md) does not exist')
+  if (!g.worktree.ready) implBlockers.push(`worktree is ${g.worktree.status} (${g.worktree.reason ?? ''})`.trim())
+  if (state.blocked) implBlockers.push(`feature is blocked: ${state.blocked.reason}`)
+  g.canImplement = { allowed: implBlockers.length === 0, blockers: implBlockers }
+
+  const prBlockers = []
+  if (g.implementation.status !== GATE.COMPLETE) {
+    prBlockers.push(
+      g.implementation.total === 0
+        ? 'no implementation checkpoints are recorded'
+        : `implementation is ${g.implementation.status} (${g.implementation.complete}/${g.implementation.total} checkpoints complete)`
+    )
+  }
+  if (g.verification.status !== GATE.PASS) prBlockers.push(`verification is ${g.verification.status}`)
+  if (!g.aiReview.satisfied) prBlockers.push(`AI review is ${g.aiReview.status}`)
+  if (config.requireAiReview && (state.aiReview?.blockers || 0) > 0) {
+    prBlockers.push(`${state.aiReview.blockers} unresolved BLOCKER finding(s) in the AI review`)
+  }
+  if (!g.humanCodeReview.approved) prBlockers.push(`human code review is ${g.humanCodeReview.status}`)
+  if (state.blocked) prBlockers.push(`feature is blocked: ${state.blocked.reason}`)
+  g.canPr = { allowed: prBlockers.length === 0, blockers: prBlockers }
+
+  g.staleApprovals = ['questions', 'design', 'structure', 'humanCodeReview'].filter((k) => g[k]?.stale)
+
+  return g
+}
+
+// ---------------------------------------------------------------------------
+// Next legal action
+// ---------------------------------------------------------------------------
+
+/**
+ * Deterministically name the next legal command. The model never invents this.
+ */
+export function nextAction(root, config, state, gates) {
+  const slug = state.feature.slug
+  const g = gates
+
+  if (state.blocked) {
+    return {
+      action: 'resolve-drift',
+      command: `/dex:design ${slug}`,
+      why: `Feature is blocked: ${state.blocked.reason}. Revise the affected upstream artifact, then re-approve it.`,
+    }
+  }
+  for (const key of ['questions', 'design', 'structure']) {
+    if (g[key].stale) {
+      return {
+        action: `reapprove-${key}`,
+        command: `/dex:approve ${key} ${slug}`,
+        why: `${key} changed after it was approved. Re-read it and approve the current version.`,
+      }
+    }
+  }
+  if (g.intent.status !== GATE.COMPLETE) {
+    return { action: 'intent', command: `/dex:start <feature description>`, why: '01-intent.md is missing.' }
+  }
+  if (g.questions.status === GATE.MISSING) {
+    return { action: 'questions', command: `/dex:questions ${slug}`, why: 'Research questions have not been drafted.' }
+  }
+  if (!g.questions.approved) {
+    return {
+      action: 'approve-questions',
+      command: `/dex:approve questions ${slug}`,
+      why: `Read ${state.artifacts.questions}, edit it freely, then approve it.`,
+    }
+  }
+  if (g.research.status !== GATE.COMPLETE) {
+    return { action: 'research', command: `/dex:research ${slug}`, why: 'Objective codebase research has not been run.' }
+  }
+  if (g.design.status === GATE.MISSING) {
+    return { action: 'design', command: `/dex:design ${slug}`, why: 'Design discussion has not started.' }
+  }
+  if (!g.design.approved) {
+    return {
+      action: 'approve-design',
+      command: `/dex:approve design ${slug}`,
+      why: `A design draft exists. Read ${state.artifacts.design} — start with its least-confident decisions. Continue the discussion with /dex:design ${slug} if it is not right yet.`,
+    }
+  }
+  if (g.structure.status === GATE.MISSING) {
+    return { action: 'structure', command: `/dex:structure ${slug}`, why: 'Program structure has not been written.' }
+  }
+  if (!g.structure.approved) {
+    return {
+      action: 'approve-structure',
+      command: `/dex:approve structure ${slug}`,
+      why: `A structure draft exists. Read ${state.artifacts.structure} — check that the checkpoints are vertical and individually observable. Revise with /dex:structure ${slug} if not.`,
+    }
+  }
+  if (g.plan.status !== GATE.COMPLETE) {
+    return { action: 'plan', command: `/dex:plan ${slug}`, why: 'The tactical implementation plan has not been generated.' }
+  }
+  if (!g.worktree.ready) {
+    return { action: 'worktree', command: `/dex:worktree ${slug}`, why: 'An isolated git worktree is required before implementation.' }
+  }
+  if (g.implementation.status !== GATE.COMPLETE) {
+    const id = g.implementation.next
+    return {
+      action: 'implement',
+      command: id ? `/dex:implement ${slug} ${id}` : `/dex:implement ${slug}`,
+      why: id ? `Checkpoint ${id} is the next incomplete checkpoint.` : 'Checkpoints are not recorded yet.',
+    }
+  }
+  if (g.verification.status !== GATE.PASS) {
+    return {
+      action: 'verify',
+      command: `/dex:verify ${slug}`,
+      why: g.verification.status === GATE.FAIL ? 'Verification failed. Fix the failure, then re-run.' : 'Full verification has not passed.',
+    }
+  }
+  if (!g.aiReview.satisfied) {
+    return {
+      action: 'review',
+      command: `/dex:review ${slug}`,
+      why: g.aiReview.status === GATE.REMEDIATION ? 'AI review requires remediation.' : 'Independent AI review has not run.',
+    }
+  }
+  if (!g.humanCodeReview.approved) {
+    return {
+      action: 'human-code-review',
+      command: `/dex:approve code ${slug}`,
+      why:
+        g.humanCodeReview.status === GATE.STALE
+          ? 'The diff changed after your approval. Read the current diff and approve again.'
+          : 'Read the production diff yourself. AI review does not substitute for this.',
+    }
+  }
+  if (!state.pr?.created) {
+    return { action: 'pr', command: `/dex:pr ${slug}`, why: 'All gates are satisfied. Prepare the pull request.' }
+  }
+  return { action: 'complete', command: null, why: 'Pull request created. Nothing further is gated.' }
+}
+
+// ---------------------------------------------------------------------------
+// Phase advancement
+// ---------------------------------------------------------------------------
+
+/**
+ * Phase is a convenience label derived from the gates, not an independent truth.
+ * Deriving it prevents the phase field and the gates from ever disagreeing.
+ */
+export function derivePhase(gates, state) {
+  const g = gates
+  if (state.pr?.created) return 'complete'
+  if (g.humanCodeReview.approved) return 'pr'
+  if (g.aiReview.satisfied && g.verification.status === GATE.PASS) return 'review'
+  if (g.implementation.status === GATE.COMPLETE) return 'verify'
+  if (g.worktree.ready && g.plan.status === GATE.COMPLETE && g.structure.approved) return 'implement'
+  if (g.plan.status === GATE.COMPLETE && g.structure.approved) return 'worktree'
+  if (g.structure.approved) return 'plan'
+  if (g.design.approved) return 'structure'
+  if (g.research.status === GATE.COMPLETE && g.questions.approved) return 'design'
+  if (g.questions.approved) return 'research'
+  if (g.intent.status === GATE.COMPLETE) return 'questions'
+  return 'initialized'
+}
+
+function refreshPhase(root, config, state) {
+  const gates = computeGates(root, config, state)
+  state.phase = derivePhase(gates, state)
+  return gates
+}
+
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
+
+const LABEL_WIDTH = 22
+
+function line(label, value) {
+  return `${pad(label, LABEL_WIDTH)}${value}`
+}
+
+export function renderStatus(root, config, state, gates) {
+  const g = gates
+  const out = []
+  out.push(`DEX: ${state.feature.slug}`)
+  out.push(`${state.feature.title}`)
+  out.push('')
+  if (state.blocked) {
+    out.push(`BLOCKED: ${state.blocked.reason}`)
+    out.push(`  since ${state.blocked.since}${state.blocked.slice ? ` at checkpoint ${state.blocked.slice}` : ''}`)
+    out.push('')
+  }
+  if (g.staleApprovals.length) {
+    for (const k of g.staleApprovals) {
+      const artifactKey = k === 'humanCodeReview' ? null : k
+      if (artifactKey) {
+        out.push(`STALE APPROVAL: ${k} changed after approval.`)
+        out.push(`  Run /dex:approve ${k} ${state.feature.slug} again.`)
+      } else {
+        out.push('HUMAN CODE APPROVAL STALE: the diff changed after approval.')
+        out.push(`  Re-read the diff, then run /dex:approve code ${state.feature.slug} again.`)
+      }
+    }
+    out.push('')
+  }
+  out.push(line('Intent', g.intent.status))
+  out.push(line('Questions', g.questions.status))
+  out.push(line('Research', g.research.status))
+  out.push(line('Design', g.design.status))
+  out.push(line('Structure', g.structure.status))
+  out.push(line('Plan', g.plan.status))
+  out.push(line('Worktree', g.worktree.status + (g.worktree.branch ? `  (${g.worktree.branch})` : '')))
+  out.push('')
+  out.push('Implementation')
+  if (!g.implementation.total) {
+    out.push('  (no checkpoints recorded — /dex:structure defines them, /dex:plan records them)')
+  } else {
+    for (const s of g.implementation.slices) {
+      const status = s.status === 'complete' ? 'COMPLETE' : s.status === 'in-progress' ? 'IN PROGRESS' : s.status === 'blocked' ? 'BLOCKED' : 'PENDING'
+      out.push(`  ${pad(`${s.id} ${s.name || ''}`.trim(), LABEL_WIDTH - 2)}${status}`)
+    }
+  }
+  out.push('')
+  out.push(line('Verification', g.verification.status))
+  out.push(line('AI Review', g.aiReview.status + (g.aiReview.blockers ? `  (${g.aiReview.blockers} blocker(s))` : '')))
+  out.push(line('Human Code Review', g.humanCodeReview.status))
+  out.push(line('PR', state.pr?.created ? GATE.CREATED : g.canPr.allowed ? GATE.READY : GATE.BLOCKED))
+  if (!g.canPr.allowed && !state.pr?.created) {
+    for (const b of g.canPr.blockers) out.push(`  - ${b}`)
+  }
+  const next = nextAction(root, config, state, gates)
+  out.push('')
+  out.push('Next:')
+  out.push(next.command ? next.command : '(nothing)')
+  if (next.why) out.push(`  ${next.why}`)
+  if (config.__warnings?.length) {
+    out.push('')
+    out.push('Config warnings:')
+    for (const w of config.__warnings) out.push(`  - ${w}`)
+  }
+  return out.join('\n')
+}
+
+// ---------------------------------------------------------------------------
+// Commands
+// ---------------------------------------------------------------------------
+
+function parseFlags(argv) {
+  const flags = {}
+  const rest = []
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i]
+    if (a.startsWith('--')) {
+      const key = a.slice(2)
+      const next = argv[i + 1]
+      if (next === undefined || next.startsWith('--')) {
+        flags[key] = true
+      } else {
+        flags[key] = next
+        i++
+      }
+    } else {
+      rest.push(a)
+    }
+  }
+  return { flags, rest }
+}
+
+function requireSlug(slug, what) {
+  if (!slug) throw new DexError(`Dex needs a feature slug.\n\nUsage: node state.mjs ${what} <feature-slug>\n\nRun "node state.mjs list" to see features.`)
+  return slug
+}
+
+const COMMANDS = {}
+
+COMMANDS.init = (ctx, argv) => {
+  const { flags, rest } = parseFlags(argv)
+  const titleFromFlag = typeof flags.title === 'string' ? flags.title : null
+  let slug = rest[0]
+  const title = titleFromFlag || rest.slice(1).join(' ') || slug
+  if (!slug) throw new DexError('Usage: node state.mjs init <slug> <title>')
+  slug = sanitizeSlug(slug)
+  const { root, config } = ctx
+  ensureConfig(root, config.stateRoot)
+  const statePath = path.join(featureStateDir(root, config, slug), 'state.json')
+  if (fs.existsSync(statePath)) {
+    const existing = loadFeatureState(root, config, slug)
+    const gates = computeGates(root, config, existing)
+    return {
+      text:
+        `Feature "${slug}" already exists (phase ${existing.phase}).\n\n` +
+        `Dex will not overwrite an in-flight feature.\n\n` +
+        `Resume it:\n  /dex:resume ${slug}\n\nNext legal action:\n  ${nextAction(root, config, existing, gates).command}`,
+      json: { slug, created: false, phase: existing.phase },
+    }
+  }
+  return withFeatureLock(root, config, slug, () => {
+    const state = newFeatureState(slug, title, config)
+    fs.mkdirSync(artifactDir(root, config, slug), { recursive: true })
+    state.phase = 'initialized'
+    saveFeatureState(root, config, slug, state)
+    writeActiveSlug(root, config, slug)
+    appendEvent(root, config, slug, 'feature_initialized', { title, artifactRoot: config.artifactRoot })
+    return {
+      text:
+        `Initialized feature "${slug}".\n\n` +
+        `Title:      ${title}\n` +
+        `State:      ${normalizeRelPath(statePath, root)}\n` +
+        `Artifacts:  ${config.artifactRoot}/${slug}/\n\n` +
+        `Write ${state.artifacts.intent} next, then run:\n  /dex:questions ${slug}`,
+      json: { slug, title, created: true, artifacts: state.artifacts },
+    }
+  })
+}
+
+COMMANDS.status = (ctx, argv) => {
+  const { flags, rest } = parseFlags(argv)
+  const slug = requireSlug(rest[0] || readActiveSlug(ctx.root, ctx.config), 'status')
+  const { root, config } = ctx
+  const state = loadFeatureState(root, config, slug)
+  const gates = refreshPhase(root, config, state)
+  if (flags.json) return { text: JSON.stringify({ state, gates }, null, 2), json: { state, gates } }
+  return { text: renderStatus(root, config, state, gates), json: { state, gates } }
+}
+
+COMMANDS.check = (ctx, argv) => {
+  const { rest } = parseFlags(argv)
+  const slug = requireSlug(rest[0] || readActiveSlug(ctx.root, ctx.config), 'check')
+  const { root, config } = ctx
+  const state = loadFeatureState(root, config, slug)
+  const gates = refreshPhase(root, config, state)
+  const next = nextAction(root, config, state, gates)
+  const payload = {
+    slug,
+    phase: state.phase,
+    blocked: state.blocked,
+    gates,
+    next,
+    config: { reviewCadence: config.reviewCadence, requireWorktree: config.requireWorktree, requireAiReview: config.requireAiReview, requireHumanCodeApproval: config.requireHumanCodeApproval, strictGates: config.strictGates, maxResearchWorkers: config.maxResearchWorkers },
+    artifacts: state.artifacts,
+    worktree: state.worktree,
+    warnings: config.__warnings || [],
+  }
+  return { text: JSON.stringify(payload, null, 2), json: payload }
+}
+
+COMMANDS.next = (ctx, argv) => {
+  const { rest } = parseFlags(argv)
+  const slug = requireSlug(rest[0] || readActiveSlug(ctx.root, ctx.config), 'next')
+  const { root, config } = ctx
+  const state = loadFeatureState(root, config, slug)
+  const gates = refreshPhase(root, config, state)
+  const next = nextAction(root, config, state, gates)
+  const text = next.command
+    ? `${next.command}\n\n${next.why}`
+    : `Nothing is pending for ${slug}.\n\n${next.why}`
+  return { text, json: next }
+}
+
+COMMANDS.approve = (ctx, argv) => {
+  const { flags, rest } = parseFlags(argv)
+  let [a, b] = rest
+  // Accept both "approve <slug> <gate>" and "approve <gate> <slug>".
+  const gateNames = new Set(['questions', 'design', 'structure', 'code'])
+  let slug = a
+  let gate = b
+  if (gateNames.has(a)) {
+    gate = a
+    slug = b
+  }
+  slug = requireSlug(slug, 'approve <gate>')
+  if (!gateNames.has(gate)) {
+    throw new DexError(`Unknown approval gate "${gate ?? ''}".\n\nValid gates: questions, design, structure, code\n\nUsage: node state.mjs approve <slug> <gate>`)
+  }
+  const { root, config } = ctx
+  return withFeatureLock(root, config, slug, () => {
+    const state = loadFeatureState(root, config, slug)
+
+    if (gate === 'code') {
+      const gatesBefore = computeGates(root, config, state)
+      if (gatesBefore.verification.status !== GATE.PASS && config.strictGates) {
+        throw new DexError(
+          `Dex will not record a human code approval while verification is ${gatesBefore.verification.status}.\n\n` +
+            `Approving code that does not pass its own tests records a false engineering signal.\n\n` +
+            `Run:\n  /dex:verify ${slug}`
+        )
+      }
+      const cwd = state.worktree?.path && fs.existsSync(state.worktree.path) ? state.worktree.path : root
+      if (!isGitRepo(cwd)) {
+        throw new DexError(
+          `Dex cannot fingerprint the production diff because ${cwd} is not a git repository.\n\n` +
+            `Human code approval is bound to a diff hash. Without git there is nothing to bind to.\n\n` +
+            `Initialize the repository, or set "requireHumanCodeApproval": false in ${normalizeRelPath(config.__path, root)} and accept that Dex stops enforcing this gate.`
+        )
+      }
+      const base = state.worktree?.base || detectBaseBranch(cwd)
+      const fp = diffFingerprint(cwd, base, config)
+      if (!fp.hash) throw new DexError(`Dex could not compute a diff fingerprint (${fp.reason}).`)
+      if (fp.trackedBytes === 0 && fp.untrackedCount === 0) {
+        throw new DexError(
+          `There is no production diff to approve against base "${fp.base ?? '(none)'}".\n\n` +
+            `Dex refuses to record an approval of an empty change.\n\n` +
+            `Check:\n  git -C ${cwd} status\n  git -C ${cwd} diff ${fp.base ?? ''}`
+        )
+      }
+      state.approvals.humanCodeReview = {
+        approved: true,
+        approvedAt: nowIso(),
+        diffHash: fp.hash,
+        base: fp.base,
+        worktree: state.worktree?.path || null,
+      }
+      const gates = refreshPhase(root, config, state)
+      saveFeatureState(root, config, slug, state)
+      appendEvent(root, config, slug, 'human_code_review_approved', { diffHash: fp.hash, base: fp.base })
+      const next = nextAction(root, config, state, gates)
+      return {
+        text:
+          `APPROVED: human code review\n` +
+          `Feature:   ${slug}\n` +
+          `Base:      ${fp.base ?? '(none)'}\n` +
+          `Diff SHA-256: ${fp.hash}\n\n` +
+          `This approval is bound to that diff. Any further production change voids it.\n\n` +
+          `Next: ${next.command ?? '(nothing)'}`,
+        json: { gate: 'humanCodeReview', diffHash: fp.hash, base: fp.base, next },
+      }
+    }
+
+    const artifactKey = gate
+    const abs = artifactAbs(root, state, artifactKey)
+    if (!artifactExists(root, state, artifactKey)) {
+      throw new DexError(
+        `Dex cannot approve ${gate}: ${state.artifacts[artifactKey]} does not exist or is empty.\n\n` +
+          `Generate it first:\n  /dex:${gate === 'questions' ? 'questions' : gate} ${slug}`
+      )
+    }
+    // Upstream gates must hold, or an approval here would rest on nothing.
+    const pre = computeGates(root, config, state)
+    if (gate === 'design' && !pre.questions.approved && config.strictGates) {
+      throw new DexError(
+        `Dex will not approve the design while questions are ${pre.questions.status}.\n\n` +
+          `A design approved on top of unapproved research questions has no factual footing.\n\n` +
+          `Run:\n  /dex:approve questions ${slug}`
+      )
+    }
+    if (gate === 'structure' && !pre.design.approved && config.strictGates) {
+      throw new DexError(
+        `Dex will not approve the structure while the design is ${pre.design.status}.\n\n` +
+          `Structure answers "how do we get there safely". Without an approved design there is no agreed destination.\n\n` +
+          `Run:\n  /dex:approve design ${slug}`
+      )
+    }
+    const hash = hashFile(abs)
+    const previous = state.approvals[artifactKey]
+    state.approvals[artifactKey] = { approved: true, approvedAt: nowIso(), artifactHash: hash }
+    const gates = refreshPhase(root, config, state)
+    saveFeatureState(root, config, slug, state)
+    appendEvent(root, config, slug, `${gate}_approved`, {
+      artifactHash: hash,
+      artifact: state.artifacts[artifactKey],
+      reapproval: Boolean(previous?.approved),
+    })
+    const next = nextAction(root, config, state, gates)
+    return {
+      text:
+        `APPROVED: ${gate}\n` +
+        `Feature:  ${slug}\n` +
+        `Artifact: ${state.artifacts[artifactKey]}\n` +
+        `SHA-256:  ${hash}\n\n` +
+        `Editing that file after this point makes the approval stale.\n\n` +
+        `Next: ${next.command ?? '(nothing)'}`,
+      json: { gate, artifactHash: hash, artifact: state.artifacts[artifactKey], next },
+    }
+  })
+}
+
+/** Transitions that only record that a stage ran. Gates still decide everything. */
+const TRANSITIONS = {
+  'questions-generated': (state) => {
+    state.__event = 'questions_generated'
+  },
+  'research-started': (state) => {
+    state.__event = 'research_started'
+  },
+  'research-complete': (state) => {
+    state.__event = 'research_completed'
+  },
+  'design-started': (state) => {
+    state.__event = 'design_started'
+  },
+  'design-updated': (state) => {
+    state.__event = 'design_updated'
+    if (state.approvals.design?.approved) state.__note = 'design changed; its approval is now stale'
+  },
+  'structure-started': (state) => {
+    state.__event = 'structure_started'
+  },
+  'plan-generated': (state) => {
+    state.__event = 'plan_generated'
+  },
+  'verification-started': (state) => {
+    state.__event = 'verification_started'
+  },
+  'review-started': (state) => {
+    state.__event = 'ai_review_started'
+  },
+  'feature-completed': (state) => {
+    state.__event = 'feature_completed'
+  },
+}
+
+COMMANDS.transition = (ctx, argv) => {
+  const { rest } = parseFlags(argv)
+  const slug = requireSlug(rest[0], 'transition')
+  const event = rest[1]
+  if (!TRANSITIONS[event]) {
+    throw new DexError(`Unknown transition "${event ?? ''}".\n\nValid transitions:\n  ${Object.keys(TRANSITIONS).join('\n  ')}`)
+  }
+  const { root, config } = ctx
+  return withFeatureLock(root, config, slug, () => {
+    const state = loadFeatureState(root, config, slug)
+    TRANSITIONS[event](state)
+    const eventName = state.__event
+    const note = state.__note
+    delete state.__event
+    delete state.__note
+    const gates = refreshPhase(root, config, state)
+    saveFeatureState(root, config, slug, state)
+    writeActiveSlug(root, config, slug)
+    appendEvent(root, config, slug, eventName, {})
+    const next = nextAction(root, config, state, gates)
+    return {
+      text: `${eventName}\nPhase: ${state.phase}${note ? `\n\nNOTE: ${note}` : ''}\n\nNext: ${next.command ?? '(nothing)'}`,
+      json: { event: eventName, phase: state.phase, note: note ?? null, next },
+    }
+  })
+}
+
+COMMANDS['set-slices'] = (ctx, argv) => {
+  const { flags, rest } = parseFlags(argv)
+  const slug = requireSlug(rest[0], 'set-slices')
+  const specs = rest.slice(1)
+  if (!specs.length) {
+    throw new DexError(
+      'Usage: node state.mjs set-slices <slug> "S1:tracer — create portfolio optimization run" "S2:happy path" ...\n\n' +
+        'Each argument is <id>:<name>. Ids come from the approved structure document.'
+    )
+  }
+  const { root, config } = ctx
+  return withFeatureLock(root, config, slug, () => {
+    const state = loadFeatureState(root, config, slug)
+    const gates = computeGates(root, config, state)
+    if (!gates.structure.approved && config.strictGates) {
+      throw new DexError(
+        `Dex will not record implementation checkpoints while the structure is ${gates.structure.status}.\n\n` +
+          `Checkpoints come from the approved structure.\n\nRun:\n  /dex:approve structure ${slug}`
+      )
+    }
+    const existing = new Map((state.slices || []).map((s) => [s.id, s]))
+    const slices = specs.map((spec) => {
+      const idx = spec.indexOf(':')
+      const id = (idx === -1 ? spec : spec.slice(0, idx)).trim()
+      const name = idx === -1 ? '' : spec.slice(idx + 1).trim()
+      if (!/^S\d+$/i.test(id)) {
+        throw new DexError(`Checkpoint id "${id}" must look like S1, S2, S3.\n\nGot: ${spec}`)
+      }
+      const prior = existing.get(id.toUpperCase())
+      return {
+        id: id.toUpperCase(),
+        name,
+        tracer: /tracer/i.test(name),
+        status: prior?.status ?? 'pending',
+        startedAt: prior?.startedAt ?? null,
+        completedAt: prior?.completedAt ?? null,
+        verification: prior?.verification ?? null,
+        note: prior?.note ?? null,
+      }
+    })
+    const dupes = slices.map((s) => s.id).filter((id, i, a) => a.indexOf(id) !== i)
+    if (dupes.length) throw new DexError(`Duplicate checkpoint ids: ${[...new Set(dupes)].join(', ')}`)
+    state.slices = slices
+    refreshPhase(root, config, state)
+    saveFeatureState(root, config, slug, state)
+    appendEvent(root, config, slug, 'plan_generated', { checkpoints: slices.map((s) => s.id), tracer: slices.some((s) => s.tracer) })
+    return {
+      text: `Recorded ${slices.length} implementation checkpoint(s):\n` + slices.map((s) => `  ${s.id}  ${s.name}${s.tracer ? '  [tracer]' : ''}`).join('\n'),
+      json: { slices },
+    }
+  })
+}
+
+function findSlice(state, id) {
+  const wanted = String(id || '').toUpperCase()
+  const slice = (state.slices || []).find((s) => s.id === wanted)
+  if (!slice) {
+    throw new DexError(
+      `Feature "${state.feature.slug}" has no checkpoint "${id}".\n\n` +
+        `Known checkpoints: ${(state.slices || []).map((s) => s.id).join(', ') || '(none recorded)'}\n\n` +
+        `Record them from the approved structure with:\n  node state.mjs set-slices ${state.feature.slug} "S1:..." "S2:..."`
+    )
+  }
+  return slice
+}
+
+COMMANDS['start-slice'] = (ctx, argv) => {
+  const { rest } = parseFlags(argv)
+  const slug = requireSlug(rest[0], 'start-slice')
+  const { root, config } = ctx
+  return withFeatureLock(root, config, slug, () => {
+    const state = loadFeatureState(root, config, slug)
+    const gates = computeGates(root, config, state)
+    if (!gates.canImplement.allowed) {
+      throw new DexError(
+        `Dex blocked checkpoint ${rest[1]} because implementation gates are not satisfied:\n\n` +
+          gates.canImplement.blockers.map((b) => `  - ${b}`).join('\n') +
+          `\n\nRun:\n  /dex:status ${slug}`
+      )
+    }
+    const slice = findSlice(state, rest[1])
+    const earlierIncomplete = (state.slices || []).filter(
+      (s) => s.status !== 'complete' && Number(s.id.slice(1)) < Number(slice.id.slice(1))
+    )
+    slice.status = 'in-progress'
+    slice.startedAt = nowIso()
+    refreshPhase(root, config, state)
+    saveFeatureState(root, config, slug, state)
+    appendEvent(root, config, slug, 'slice_started', { slice: slice.id })
+    const warn = earlierIncomplete.length
+      ? `\n\nNOTE: earlier checkpoint(s) ${earlierIncomplete.map((s) => s.id).join(', ')} are not complete. Checkpoints are ordered for a reason — confirm this is deliberate.`
+      : ''
+    return { text: `Checkpoint ${slice.id} started: ${slice.name}${warn}`, json: { slice } }
+  })
+}
+
+COMMANDS['finish-slice'] = (ctx, argv) => {
+  const { flags, rest } = parseFlags(argv)
+  const slug = requireSlug(rest[0], 'finish-slice')
+  const { root, config } = ctx
+  return withFeatureLock(root, config, slug, () => {
+    const state = loadFeatureState(root, config, slug)
+    const slice = findSlice(state, rest[1])
+    if (!flags.verification) {
+      throw new DexError(
+        `Dex will not mark checkpoint ${slice.id} complete without its verification result.\n\n` +
+          `A checkpoint whose verification was never run is not a checkpoint.\n\n` +
+          `Usage:\n  node state.mjs finish-slice ${slug} ${slice.id} --verification "npm test -- portfolio" --note "..."`
+      )
+    }
+    slice.status = 'complete'
+    slice.completedAt = nowIso()
+    slice.verification = String(flags.verification)
+    if (typeof flags.note === 'string') slice.note = flags.note
+    const gates = refreshPhase(root, config, state)
+    saveFeatureState(root, config, slug, state)
+    appendEvent(root, config, slug, 'slice_implemented', { slice: slice.id, verification: slice.verification })
+    const remaining = (state.slices || []).filter((s) => s.status !== 'complete')
+    const next = nextAction(root, config, state, gates)
+    const cadenceNote =
+      config.reviewCadence === 'slice'
+        ? `\n\nreviewCadence is "slice": a human should read this checkpoint's diff before the next one starts.`
+        : config.reviewCadence === 'checkpoint' && slice.tracer
+          ? `\n\nreviewCadence is "checkpoint" and this was the tracer: a human should read the diff before deepening.`
+          : ''
+    return {
+      text:
+        `Checkpoint ${slice.id} COMPLETE: ${slice.name}\n` +
+        `Verification: ${slice.verification}\n` +
+        `Remaining: ${remaining.map((s) => s.id).join(', ') || '(none)'}${cadenceNote}\n\n` +
+        `Next: ${next.command ?? '(nothing)'}`,
+      json: { slice, remaining: remaining.map((s) => s.id), next },
+    }
+  })
+}
+
+COMMANDS['block-slice'] = (ctx, argv) => {
+  const { flags, rest } = parseFlags(argv)
+  const slug = requireSlug(rest[0], 'block-slice')
+  if (!flags.reason) throw new DexError(`Usage: node state.mjs block-slice ${slug} <id> --reason "what blocks it"`)
+  const { root, config } = ctx
+  return withFeatureLock(root, config, slug, () => {
+    const state = loadFeatureState(root, config, slug)
+    const slice = findSlice(state, rest[1])
+    slice.status = 'blocked'
+    slice.note = String(flags.reason)
+    refreshPhase(root, config, state)
+    saveFeatureState(root, config, slug, state)
+    appendEvent(root, config, slug, 'slice_blocked', { slice: slice.id, reason: slice.note })
+    return { text: `Checkpoint ${slice.id} BLOCKED: ${slice.note}`, json: { slice } }
+  })
+}
+
+COMMANDS.verification = (ctx, argv) => {
+  const { flags, rest } = parseFlags(argv)
+  const slug = requireSlug(rest[0], 'verification')
+  const result = rest[1]
+  if (!['pass', 'fail', 'reset'].includes(result)) {
+    throw new DexError(
+      `Usage: node state.mjs verification <slug> <pass|fail|reset> [--command "cmd" --exit 0]...\n\n` +
+        `Pass --commands-json '[{"command":"npm test","exitCode":0}]' to record several at once.`
+    )
+  }
+  const { root, config } = ctx
+  return withFeatureLock(root, config, slug, () => {
+    const state = loadFeatureState(root, config, slug)
+    let commands = []
+    if (typeof flags['commands-json'] === 'string') {
+      try {
+        commands = JSON.parse(flags['commands-json'])
+      } catch (err) {
+        throw new DexError(`--commands-json is not valid JSON: ${err.message}`)
+      }
+      if (!Array.isArray(commands)) throw new DexError('--commands-json must be a JSON array.')
+    } else if (typeof flags.command === 'string') {
+      commands = [{ command: flags.command, exitCode: flags.exit === undefined ? null : Number(flags.exit) }]
+    }
+    commands = commands.map((c) => ({
+      command: String(c.command ?? '').slice(0, 400),
+      exitCode: c.exitCode === null || c.exitCode === undefined ? null : Number(c.exitCode),
+      category: c.category ? String(c.category).slice(0, 40) : null,
+      summary: c.summary ? String(c.summary).slice(0, 600) : null,
+    }))
+    if (result === 'reset') {
+      state.verification = { status: 'not-run', commands: [], lastResult: null, ranAt: null }
+    } else {
+      if (!commands.length) {
+        throw new DexError(
+          `Dex will not record verification ${result} with no commands.\n\n` +
+            `Verification means "these exact commands ran and this is what they returned".\n\n` +
+            `Usage:\n  node state.mjs verification ${slug} ${result} --command "./gradlew test" --exit 0`
+        )
+      }
+      const failing = commands.filter((c) => c.exitCode !== 0)
+      if (result === 'pass' && failing.length) {
+        throw new DexError(
+          `Dex refuses to record verification PASS while ${failing.length} command(s) reported a non-zero exit code:\n\n` +
+            failing.map((c) => `  exit ${c.exitCode}: ${c.command}`).join('\n') +
+            `\n\nA deterministic failure outranks any model's judgment that the code is fine. Record it as failed, fix it, then re-run.`
+        )
+      }
+      state.verification = {
+        status: result === 'pass' ? 'passed' : 'failed',
+        commands,
+        lastResult: typeof flags.summary === 'string' ? String(flags.summary).slice(0, 2000) : null,
+        ranAt: nowIso(),
+      }
+    }
+    const gates = refreshPhase(root, config, state)
+    saveFeatureState(root, config, slug, state)
+    if (result !== 'reset') {
+      appendEvent(root, config, slug, result === 'pass' ? 'verification_passed' : 'verification_failed', {
+        commands: commands.map((c) => ({ command: c.command, exitCode: c.exitCode })),
+      })
+    }
+    const next = nextAction(root, config, state, gates)
+    return {
+      text: `Verification: ${state.verification.status.toUpperCase()}\n` + commands.map((c) => `  exit ${c.exitCode}  ${c.command}`).join('\n') + `\n\nNext: ${next.command ?? '(nothing)'}`,
+      json: { verification: state.verification, next },
+    }
+  })
+}
+
+COMMANDS['record-review'] = (ctx, argv) => {
+  const { flags, rest } = parseFlags(argv)
+  const slug = requireSlug(rest[0], 'record-review')
+  const conclusion = rest[1]
+  if (!['pass', 'remediation-required'].includes(conclusion)) {
+    throw new DexError(`Usage: node state.mjs record-review <slug> <pass|remediation-required> [--blockers N] [--high N]`)
+  }
+  const { root, config } = ctx
+  return withFeatureLock(root, config, slug, () => {
+    const state = loadFeatureState(root, config, slug)
+    const blockers = flags.blockers === undefined ? 0 : Number(flags.blockers)
+    if (!Number.isInteger(blockers) || blockers < 0) throw new DexError('--blockers must be a non-negative integer.')
+    if (conclusion === 'pass' && blockers > 0) {
+      throw new DexError(`An AI review with ${blockers} BLOCKER finding(s) cannot conclude PASS. Record it as remediation-required.`)
+    }
+    state.aiReview = {
+      status: 'completed',
+      conclusion,
+      blockers,
+      high: flags.high === undefined ? null : Number(flags.high),
+      completedAt: nowIso(),
+    }
+    const gates = refreshPhase(root, config, state)
+    saveFeatureState(root, config, slug, state)
+    appendEvent(root, config, slug, 'ai_review_completed', { conclusion, blockers })
+    const next = nextAction(root, config, state, gates)
+    return {
+      text:
+        `AI review recorded: ${conclusion.toUpperCase()} (${blockers} blocker(s))\n\n` +
+        `AI REVIEW DOES NOT REPLACE HUMAN CODE REVIEW. It never records a human approval.\n\n` +
+        `Next: ${next.command ?? '(nothing)'}`,
+      json: { aiReview: state.aiReview, next },
+    }
+  })
+}
+
+COMMANDS['record-worktree'] = (ctx, argv) => {
+  const { flags, rest } = parseFlags(argv)
+  const slug = requireSlug(rest[0], 'record-worktree')
+  const branch = rest[1]
+  const wtPath = rest[2]
+  if (!branch || !wtPath) throw new DexError(`Usage: node state.mjs record-worktree <slug> <branch> <path> [--base <ref>]`)
+  const { root, config } = ctx
+  return withFeatureLock(root, config, slug, () => {
+    const state = loadFeatureState(root, config, slug)
+    const abs = path.resolve(wtPath)
+    if (!fs.existsSync(abs)) {
+      throw new DexError(`Dex will not record a worktree at ${abs} because that path does not exist.\n\nCreate it first, then record it.`)
+    }
+    state.worktree = {
+      required: config.requireWorktree,
+      ready: true,
+      branch,
+      path: abs,
+      base: typeof flags.base === 'string' ? flags.base : detectBaseBranch(abs) || null,
+    }
+    const gates = refreshPhase(root, config, state)
+    saveFeatureState(root, config, slug, state)
+    appendEvent(root, config, slug, 'worktree_created', { branch, path: abs, base: state.worktree.base })
+    const next = nextAction(root, config, state, gates)
+    return {
+      text: `Worktree recorded.\n  branch: ${branch}\n  path:   ${abs}\n  base:   ${state.worktree.base ?? '(none detected)'}\n\nNext: ${next.command ?? '(nothing)'}`,
+      json: { worktree: state.worktree, next },
+    }
+  })
+}
+
+COMMANDS['record-pr'] = (ctx, argv) => {
+  const { flags, rest } = parseFlags(argv)
+  const slug = requireSlug(rest[0], 'record-pr')
+  const { root, config } = ctx
+  return withFeatureLock(root, config, slug, () => {
+    const state = loadFeatureState(root, config, slug)
+    const gates = computeGates(root, config, state)
+    if (!gates.canPr.allowed) {
+      throw new DexError(
+        `Dex blocked the pull request. Unsatisfied requirements:\n\n` +
+          gates.canPr.blockers.map((b) => `  - ${b}`).join('\n') +
+          `\n\nRun:\n  /dex:status ${slug}`
+      )
+    }
+    state.pr = { created: true, url: typeof flags.url === 'string' ? flags.url : null, createdAt: nowIso() }
+    refreshPhase(root, config, state)
+    saveFeatureState(root, config, slug, state)
+    appendEvent(root, config, slug, 'pr_created', { url: state.pr.url })
+    appendEvent(root, config, slug, 'feature_completed', {})
+    return { text: `PR recorded${state.pr.url ? `: ${state.pr.url}` : ''}\nFeature "${slug}" is complete.`, json: { pr: state.pr } }
+  })
+}
+
+COMMANDS.drift = (ctx, argv) => {
+  const { flags, rest } = parseFlags(argv)
+  const slug = requireSlug(rest[0], 'drift')
+  if (!flags.reason) {
+    throw new DexError(`Usage: node state.mjs drift <slug> --reason "what the repository shows that the design assumed otherwise" [--slice S2]`)
+  }
+  const { root, config } = ctx
+  return withFeatureLock(root, config, slug, () => {
+    const state = loadFeatureState(root, config, slug)
+    state.blocked = {
+      reason: String(flags.reason).slice(0, 1000),
+      slice: typeof flags.slice === 'string' ? flags.slice.toUpperCase() : null,
+      since: nowIso(),
+      kind: 'design-drift',
+    }
+    if (state.blocked.slice) {
+      const slice = (state.slices || []).find((s) => s.id === state.blocked.slice)
+      if (slice) slice.status = 'blocked'
+    }
+    saveFeatureState(root, config, slug, state)
+    appendEvent(root, config, slug, 'design_drift_recorded', { slice: state.blocked.slice, reason: state.blocked.reason })
+    return {
+      text:
+        `DESIGN DRIFT recorded. Feature "${slug}" is blocked.\n\n` +
+        `Reason: ${state.blocked.reason}\n\n` +
+        `Record the evidence in ${state.artifacts.implementationLog}, then revise the affected artifact:\n` +
+        `  /dex:design ${slug}      (if the destination changed)\n` +
+        `  /dex:structure ${slug}   (if only the route changed)\n\n` +
+        `Re-approve it, then:\n  node state.mjs unblock ${slug}`,
+      json: { blocked: state.blocked },
+    }
+  })
+}
+
+COMMANDS.unblock = (ctx, argv) => {
+  const { rest } = parseFlags(argv)
+  const slug = requireSlug(rest[0], 'unblock')
+  const { root, config } = ctx
+  return withFeatureLock(root, config, slug, () => {
+    const state = loadFeatureState(root, config, slug)
+    if (!state.blocked) return { text: `Feature "${slug}" is not blocked.`, json: { blocked: null } }
+    const gates = computeGates(root, config, state)
+    const stale = gates.staleApprovals.filter((k) => k !== 'humanCodeReview')
+    if (stale.length) {
+      throw new DexError(
+        `Dex will not unblock "${slug}" while these approvals are stale: ${stale.join(', ')}.\n\n` +
+          `The drift was resolved by changing an artifact, so that artifact needs a fresh human approval.\n\n` +
+          stale.map((k) => `  /dex:approve ${k} ${slug}`).join('\n')
+      )
+    }
+    const was = state.blocked
+    state.blocked = null
+    for (const s of state.slices || []) if (s.status === 'blocked') s.status = 'pending'
+    const after = refreshPhase(root, config, state)
+    saveFeatureState(root, config, slug, state)
+    appendEvent(root, config, slug, 'drift_resolved', { previousReason: was.reason })
+    return { text: `Feature "${slug}" unblocked.\nPhase: ${state.phase}\n\nNext: ${nextAction(root, config, state, after).command ?? '(nothing)'}`, json: { phase: state.phase } }
+  })
+}
+
+COMMANDS.active = (ctx, argv) => {
+  const { rest } = parseFlags(argv)
+  const { root, config } = ctx
+  if (rest[0]) {
+    loadFeatureState(root, config, rest[0])
+    writeActiveSlug(root, config, rest[0])
+    return { text: `Active feature set to "${rest[0]}".`, json: { active: rest[0] } }
+  }
+  const resolved = resolveActiveFeature(root, config)
+  if (resolved.ambiguous) {
+    return {
+      text: `Several features are active and none is marked current:\n  ${resolved.candidates.join('\n  ')}\n\nChoose one:\n  node state.mjs active <slug>`,
+      json: resolved,
+    }
+  }
+  return { text: resolved.slug ?? '(no active feature)', json: { active: resolved.slug } }
+}
+
+COMMANDS.list = (ctx) => {
+  const { root, config } = ctx
+  const features = listFeatures(root, config)
+  if (!features.length) return { text: 'No Dex features in this repository.\n\nStart one:\n  /dex:start <feature description>', json: { features: [] } }
+  const active = readActiveSlug(root, config)
+  const rows = features.map((f) => {
+    const gates = computeGates(root, config, f.state)
+    const flags = []
+    if (gates.staleApprovals.length) flags.push(`STALE:${gates.staleApprovals.join(',')}`)
+    if (f.state.blocked) flags.push('BLOCKED')
+    if (f.slug === active) flags.push('active')
+    return `  ${pad(f.slug, 34)}${pad(derivePhase(gates, f.state), 14)}${flags.join(' ')}`
+  })
+  return { text: `DEX FEATURES\n\n${rows.join('\n')}`, json: { features: features.map((f) => ({ slug: f.slug, phase: f.phase })) } }
+}
+
+COMMANDS.config = (ctx) => {
+  const { root, config } = ctx
+  const shown = { ...config }
+  delete shown.__warnings
+  delete shown.__path
+  delete shown.__exists
+  const warn = config.__warnings?.length ? `\n\nWarnings:\n${config.__warnings.map((w) => `  - ${w}`).join('\n')}` : ''
+  return {
+    text: `Config: ${normalizeRelPath(config.__path, root)}${config.__exists ? '' : ' (not present — using defaults)'}\n\n${JSON.stringify(shown, null, 2)}${warn}`,
+    json: shown,
+  }
+}
+
+COMMANDS['diff-hash'] = (ctx, argv) => {
+  const { flags, rest } = parseFlags(argv)
+  const { root, config } = ctx
+  const slug = rest[0] || readActiveSlug(root, config)
+  let cwd = root
+  let base = typeof flags.base === 'string' ? flags.base : null
+  if (slug) {
+    const state = loadFeatureState(root, config, slug)
+    if (state.worktree?.path && fs.existsSync(state.worktree.path)) cwd = state.worktree.path
+    base = base || state.worktree?.base || null
+  }
+  base = base || detectBaseBranch(cwd)
+  const fp = diffFingerprint(cwd, base, config)
+  return {
+    text: `cwd:   ${cwd}\nbase:  ${fp.base ?? '(none)'}\nhash:  ${fp.hash ?? '(none)'}\ntracked diff bytes: ${fp.trackedBytes ?? 0}\nuntracked files:    ${fp.untrackedCount ?? 0}`,
+    json: fp,
+  }
+}
+
+COMMANDS.events = (ctx, argv) => {
+  const { flags, rest } = parseFlags(argv)
+  const slug = requireSlug(rest[0] || readActiveSlug(ctx.root, ctx.config), 'events')
+  const { root, config } = ctx
+  const limit = flags.limit ? Number(flags.limit) : 40
+  const all = readEvents(root, config, slug)
+  const tail = all.slice(-limit)
+  return {
+    text: tail.map((e) => `${e.timestamp ?? '?'}  ${e.event}${e.details && Object.keys(e.details).length ? '  ' + JSON.stringify(e.details) : ''}`).join('\n') || '(no events)',
+    json: { events: tail },
+  }
+}
+
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+export function run(argv, { cwd = process.cwd() } = {}) {
+  const [command, ...rest] = argv
+  if (!command || command === 'help' || command === '--help') {
+    return {
+      text:
+        `Dex state machine\n\nCommands:\n  ` +
+        Object.keys(COMMANDS).sort().join('\n  ') +
+        `\n\nEvery gate decision lives here, not in a prompt.`,
+      json: { commands: Object.keys(COMMANDS).sort() },
+    }
+  }
+  const handler = COMMANDS[command]
+  if (!handler) {
+    throw new DexError(`Unknown command "${command}".\n\nValid commands:\n  ${Object.keys(COMMANDS).sort().join('\n  ')}`)
+  }
+  const root = findRepoRoot(cwd)
+  const config = loadConfig(root)
+  return handler({ root, config, cwd }, rest)
+}
+
+const isMain = process.argv[1] && import.meta.url === new URL(`file://${path.resolve(process.argv[1])}`).href
+if (isMain) {
+  try {
+    const result = run(process.argv.slice(2))
+    process.stdout.write((result.text ?? '') + '\n')
+    process.exit(0)
+  } catch (err) {
+    if (err instanceof DexError) {
+      process.stderr.write(err.message + '\n')
+      process.exit(err.exitCode)
+    }
+    process.stderr.write(`Dex internal error: ${err.stack || err.message}\n`)
+    process.exit(1)
+  }
+}

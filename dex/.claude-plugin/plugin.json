@@ -1,0 +1,20 @@
+{
+  "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
+  "name": "dex",
+  "displayName": "Dex",
+  "version": "0.1.0",
+  "description": "A rigorous brownfield engineering workflow for Claude Code focused on context isolation, human design ownership, vertical planning, incremental implementation, and production code review.",
+  "author": {
+    "name": "rcforte"
+  },
+  "homepage": "https://github.com/rcforte/dex",
+  "license": "MIT",
+  "keywords": [
+    "brownfield",
+    "agentic-engineering",
+    "context-engineering",
+    "software-engineering",
+    "planning",
+    "code-review"
+  ]
+}
