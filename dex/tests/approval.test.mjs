@@ -278,3 +278,17 @@ test('finding 19: several active features and no usable marker block changes', a
   assert.equal(r.decision, 'deny')
   assert.match(r.reason, /feat-a/)
 })
+
+test('finding 2: with a custom stateRoot, .dex/config.json is protected too', async () => {
+  const root = makeRepo()
+  write(root, '.dex/config.json', JSON.stringify({ schemaVersion: 1, stateRoot: '.dex-state' }))
+  // Implementation is unlocked here, so only the state-folder rule can refuse these.
+  await advanceTo(root, 'feat', 'worktree')
+  for (const call of [
+    { tool_name: 'Write', tool_input: { file_path: path.join(root, '.dex/config.json'), content: '{}' } },
+    { tool_name: 'Bash', tool_input: { command: 'echo {} > .dex/config.json' } },
+    { tool_name: 'Write', tool_input: { file_path: path.join(root, '.dex-state/feat/state.json'), content: '{}' } },
+  ]) {
+    assert.equal(runGuard({ cwd: root, ...call }).decision, 'deny', JSON.stringify(call.tool_input))
+  }
+})

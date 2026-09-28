@@ -147,7 +147,8 @@ export function locate(target, cwd, { root, worktrees = [], config }) {
 }
 
 function classify(rel, main, config) {
-  if (main && isUnder(rel, config.stateRoot)) return { where: 'state', rel }
+  // .dex/ always holds config.json, even when stateRoot points elsewhere.
+  if (main && (isUnder(rel, config.stateRoot) || isUnder(rel, '.dex'))) return { where: 'state', rel }
   if (isUnder(rel, config.artifactRoot)) return { where: 'artifact', rel }
   return { where: 'repo', rel }
 }
