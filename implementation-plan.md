@@ -5,10 +5,11 @@
 This plan fixes findings 1–30 in `review-findings.md`. It also fixes the Low findings wherever they touch code a step already changes.
 
 The plan is split into nine steps, numbered 0 to 8. Each step follows the same order:
-1. Write the tests first.
+1. Write the tests from the step's "How to test" table, and watch them fail.
 2. Make the change.
 3. Run the full suite: `node --test dex/tests/*.test.mjs`.
-4. Commit.
+4. Run the step's live checks, if it has any.
+5. Commit.
 
 Paths are relative to `dex/`. "Finding N" refers to `review-findings.md`.
 
@@ -33,6 +34,31 @@ These were agreed before writing the plan.
 | Q13 | Put this project under git? | Yes. One commit per step. |
 | Q14 | Who follows the plan? | The human. The plan is written so an agent could follow it too. |
 | Q15 | How does the human approve? | A hook reads the `/dex:approve` messages you type. Running `state.mjs approve` in your own terminal is the backup. The model's calls to it are refused. |
+
+---
+
+## How testing works
+
+Every change in this plan gets at least one test. The test must fail before the change and pass after it. A test that passes before the change proves nothing, so run each new test once against the old code before writing the fix.
+
+Each test name starts with the finding it covers, such as `finding 4: staging after approval keeps it valid`. That makes it easy to mark findings fixed later.
+
+There are three kinds of test.
+
+**1. Automated tests** (`node --test dex/tests/*.test.mjs`). These are most of the work. Each test builds a throwaway git repo in the system temp folder, like the existing tests do. Step 0 adds these helpers to `tests/helpers.mjs`:
+
+| Helper | What it does |
+|---|---|
+| `makeRepo({ origin: true })` | The existing repo helper, plus a bare repo wired up as `origin`, so real pushes can be tested. |
+| `advanceTo`, `completeImplementation` | Already exist. They drive a feature to a given stage through the real CLI. |
+| `runGuard(payload)` | Runs `scripts/guard.mjs` as a real process with the payload on stdin, and returns `allow` or `deny` with the reason. Most existing guard tests call `decide()` directly, which skips how the guard finds the repo and the feature. The new tests use `runGuard`. |
+| `runPromptHook(prompt, cwd)` | Runs the new approval hook as a real process, the same way. |
+| `runWorkflow(file, args, fakeAgent)` | Runs a workflow script in Node. It removes `export` from `meta` and runs the body as an async function. `agent`, `parallel`, `pipeline`, `phase` and `log` are fakes the test controls. The fake `agent` returns canned answers and records every prompt and option it was given. Today the workflows are only checked as text; this lets their logic be tested. |
+| `staticText(glob)` | Reads skill, workflow and hook files, for checks such as "no skill runs `state.mjs approve`". |
+
+**2. Real git.** The `pre-push` hook and `/dex:pr` are tested with real `git push` calls to the bare `origin`, not with guard payloads.
+
+**3. Live checks in Claude Code.** Hooks firing, skills running and workflows running can only be fully tested in a real session. Each step lists its live checks. Run them in a small sample project: step 0 creates `~/dev/code/dex-sample`, a git repo with one source file, one test and a `main` branch. Tick each check off in `dex/tests/LIVE-CHECKS.md` with the date.
 
 ---
 
@@ -64,7 +90,20 @@ These were agreed before writing the plan.
    Both cases fail today, because of findings 3, 4 and 10. They must pass by the end of step 3.
 6. **Add `tests/skills-cli.test.mjs`.** It pulls every `state.mjs <command> --flag` out of `skills/**/SKILL.md` and `workflows/*.js`, and checks each command and flag exists in `state.mjs`.
 
-**Done when** `NOTES.md` answers both questions and the two new test files exist. `e2e` is red. `skills-cli` is green, or red for known reasons.
+7. **Build the test helpers** described in "How testing works": `runGuard`, `runPromptHook`, `runWorkflow`, `staticText`, and the `origin` option on `makeRepo`. Each helper gets one small test of its own. For example, `runWorkflow` runs `research.js` with a fake agent and returns its result object.
+8. **Create the sample project** `~/dev/code/dex-sample` and the empty checklist `dex/tests/LIVE-CHECKS.md`.
+
+### How to test step 0
+
+| Change | Test | Expected |
+|---|---|---|
+| `${CLAUDE_PLUGIN_ROOT}` check | Live: run the throwaway skill in `dex-sample`. | A real path, or the literal text. Either way, the answer is recorded in `NOTES.md`. |
+| Prompt hook check | Live: type `/dex:status foo`, then read the saved stdin file. | The field name, and whether it holds `/dex:status foo` exactly. Recorded in `NOTES.md`. |
+| `e2e.test.mjs` | Run it. | Both cases fail, and the failure messages point at findings 3, 4 and 10. If they fail for any other reason, fix the test first. |
+| `skills-cli.test.mjs` | Run it. Then add a made-up flag to one skill and run it again. | The made-up flag makes it fail. Remove the flag. |
+| New helpers | Their own small tests. | Green. |
+
+**Done when** `NOTES.md` answers both questions and the two new test files exist. `e2e` is red. `skills-cli` is green, or red for known reasons. The helpers and the sample project exist.
 
 ---
 
@@ -92,12 +131,24 @@ These were agreed before writing the plan.
    - Its branch must match the branch given.
    - `--base` must resolve to a commit that is not the worktree's HEAD.
 
-**Tests:**
-- `state.mjs check` and the guard with `cwd` set to the worktree, and to a subfolder of it.
-- `.dex/` does not appear in `git status` after `init`.
-- The worktree precondition passes right after `init`.
-- Changing the config after `init` changes the worktree gate.
-- `record-worktree <slug> main .` is refused.
+### How to test step 1
+
+| Change | Test | Expected |
+|---|---|---|
+| `findRepoRoot` from a worktree | `advanceTo(root, 'feat', 'worktree')`, then `state(worktree, ['check', 'feat'])`. | The feature is found. |
+| … from a subfolder of the worktree | The same, with `cwd` set to `<worktree>/src`. | The feature is found. |
+| … with no git | `makeRepo({ git: false })` with a `.dex/` folder. | The feature is found through the walk-up fallback. |
+| Guard from the worktree | `runGuard` with `git push` and `cwd: worktree`, before code approval. | `deny`. This is the case that fails today. |
+| `.dex/` ignored | Run `init`, then `git status --porcelain`. Run `init` for a second feature and read `info/exclude`. | No `.dex` line in the status. Exactly one `.dex/` line in the exclude file. |
+| Dirty-tree check | Run `init`, then the exact `git status` command from the worktree skill. | Empty output. |
+| Worktree skill text | `staticText`: the worktree skill has no built-in worktree option. No skill contains `cd <worktree>`. | Both pass. |
+| `requireWorktree` read live | Run `init`. Set it to `false` and run `check`. Set it back to `true` and run `check`. | NOT-REQUIRED, then NOT-READY. |
+| `record-worktree` checks | Pass: a plain folder, the main checkout, a wrong branch name, `--base HEAD`, and then a valid worktree. | The first four are refused with a clear reason. The valid one is accepted. |
+
+**Live check:** in `dex-sample`, run `/dex:start` and then `/dex:worktree`.
+- The worktree appears next to the project.
+- The command does not stop on "uncommitted changes".
+- `/dex:status` works both from the main checkout and after asking Claude to run it from the worktree.
 
 ---
 
@@ -128,12 +179,31 @@ These were agreed before writing the plan.
      2. otherwise the active feature;
      3. otherwise, if features exist but none can be picked, deny changes.
 
-**Tests:**
-- The model's `state.mjs approve` is denied.
-- Writes to `.dex/config.json` and `.dex/<slug>/state.json` are denied, by Write, Edit, `echo >`, `cp` and `rm`.
-- A corrupt `state.json` denies Write to `src/`, `git push` and `sh -c "git push"`.
-- The approve hook records the approval for a matching prompt, ignores others, and ignores extra words after the slug.
-- Two features, each checked against its own worktree.
+### How to test step 2
+
+| Change | Test | Expected |
+|---|---|---|
+| Approval hook | `runPromptHook('/dex:approve questions feat')`, after the questions are written. | Questions APPROVED. The hook's output contains `additionalContext` that says so. |
+| … other prompts | `runPromptHook` with `hello`, `/dex:status feat`, `/dex:approve questions feat please`, and `/dex:approve questions ../x`. | No state change. No approval output. |
+| … refused approval | `runPromptHook('/dex:approve design feat')` before questions are approved. | No state change. The context explains why. |
+| Hook registered | `staticText`: `hooks.json` has a `UserPromptSubmit` entry that points at the approval hook. | Pass. |
+| Approve skill | `staticText`: the approve skill does not contain `state.mjs approve`. | Pass. |
+| Guard refuses model approvals | `runGuard` with:<br>- `node /p/state.mjs approve design feat`<br>- the reversed argument order<br>- extra spaces<br>- `cd x && node state.mjs approve …`<br>- `sh -c "node state.mjs approve …"` | All `deny`. The last one passes only after step 5; mark it as expected to fail until then. |
+| … but allows other CLI calls | `runGuard` with `node state.mjs status feat` and `node state.mjs transition feat design-updated`. | `allow`. |
+| `.dex/` protected | `runGuard` with:<br>- Write `.dex/config.json`<br>- Edit `.dex/feat/state.json`<br>- `echo {} > .dex/config.json`<br>- `cp x .dex/feat/state.json`<br>- `rm -rf .dex` | All `deny`, in every phase including after full approval. |
+| Artifacts still writable | `runGuard` with Write `docs/dex/feat/04-design.md`. | `allow`. |
+| `readJson` | Unit test on a missing file, then on a file containing `{`. | The fallback, then a thrown error. |
+| Corrupt state blocks changes | Write `{ "schemaVersion": 1, ` into `state.json`. `runGuard` with Write `src/A.java`, `git push`, `sh -c "git push"` and `cat src/A.java`. | `deny`, `deny`, `deny`, `allow`. |
+| … broken active marker | Two features, and `.dex/active` naming one that doesn't exist. `runGuard` with Write `src/A.java`. | `deny`. |
+| … config `[]` | `runGuard` with Write `src/A.java`. | `deny`. Today this crashes and allows. |
+| Feature chosen by worktree | Feature A is in its worktree and ready to implement. Feature B is early and active. `runGuard` with Write `<A's worktree>/src/X.java`, then Write `src/X.java` in the main checkout. | `allow`, then `deny`. |
+| Commands set the active feature | Run `start-slice B S1` while A is active. | `.dex/active` now says `B`. |
+
+**Live checks** in `dex-sample`:
+- Type `/dex:approve questions <slug>`. `/dex:status` shows APPROVED.
+- Ask Claude: "approve the design for me". The refusal is visible, and the design is not approved.
+- Repeat that request in auto mode. It is still refused.
+- If step 0 ruled out the hook: run `node …/state.mjs approve questions <slug>` in your own terminal. It works.
 
 ---
 
@@ -169,10 +239,29 @@ The approval should cover exactly what gets pushed, and it should not change whe
 7. **`status --review` uses the same base.** It lists files from `git diff --name-status <baseSha> <tree>`. Renames are checked on both sides.
 8. **Speed.** The guard computes the tree only for publish commands, not for every tool call (finding 40).
 
-**Tests:** each case in findings 4, 5, 6, 11 and 30, plus:
-- approve, then add, then commit: still approved;
-- `artifactRoot: "."` is rejected;
-- `status --review` lists exactly the files that differ in the hashed tree.
+### How to test step 3
+
+Most cases start from `advanceTo(…, 'worktree')`, `completeImplementation`, and an approved code gate.
+
+| Change | Test | Expected |
+|---|---|---|
+| Base pinned | After `record-worktree`, read the state. Then do the same with `requireWorktree: false` after the first `start-slice`. | `baseSha` equals `git merge-base main HEAD`, in both cases. |
+| No base, no approval | `requireWorktree: false`, with no `start-slice` yet, so no base is pinned. Approve code. | Refused. |
+| Staging and committing keep it valid | Approve. Run `git add -A` and `check`. Then run `git commit` and `check`. | Still APPROVED both times. This is finding 4. |
+| Real changes make it stale | Separate tests: edit a tracked file; add a new file; delete a file; change a binary file; rename a file. | STALE every time. |
+| Working on `main` | `requireWorktree: false`. Approve, then commit a new file on `main`. | STALE. This is finding 5. |
+| Commit, then revert the working tree | Approve. Commit an `EVIL` line, then `git checkout HEAD~1 -- file`. `runGuard` with `git push`. | `deny`, with a reason saying HEAD differs from what was approved. |
+| Dirty tree at push | Approve. Leave one uncommitted change. `runGuard` with `git push`. | `deny`. |
+| Only Dex's own files skipped | After approval, change `docs/dex/feat/04-design.md` and check the code approval. Then add `docs/dex/lib/Evil.java`. Then add `.dex/evil.sh` with `git add -f` and commit it. | Still approved (the design goes stale separately). Then STALE. Then the push is denied. |
+| Config roots | Set `artifactRoot` to `.`, `..`, `../x`, `/abs` and `src/../..` in turn. | Each one gives a warning and falls back to the default. |
+| `review.js` uses configured roots | `runWorkflow('review.js', { artifactRoot: 'notes', … })`. | The prompts mention `notes/`. None mention `docs/dex`. |
+| Verification tied to the tree | Record a pass. Edit a file. Run `check`. | Verification is NOT-RUN. The same test for review. |
+| No early verification or review | Run `verification feat pass` with S2 unfinished. The same for `record-review`. | Both refused. |
+| `status --review` file list | A feature with a new untracked file, a renamed file, a file under `docs/dexter/`, and a file moved out of `docs/dex/`. Compare the listed files with `git diff --name-only <baseSha> <tree>`. | The two lists are identical. |
+| Tree computed only for publishing | Set `DEX_TRACE=1`. `runGuard` with a Write after approval, then with `git push`. | Only the push logs `workTree` to stderr. |
+| End-to-end | `tests/e2e.test.mjs`. | Green. |
+
+**Live check:** in `dex-sample`, finish a small feature up to code approval. Then ask Claude to stage and commit. `/dex:status` still shows the code as APPROVED.
 
 **Done when** `tests/e2e.test.mjs` is green.
 
@@ -204,7 +293,7 @@ The approval should cover exactly what gets pushed, and it should not change whe
    - `unblock` needs a design or structure approval recorded after the drift, and no missing artifacts.
    - `unblock` only resets checkpoints that the drift blocked.
    - The approve hook runs `unblock` automatically after a re-approval, when these conditions hold.
-   - `next` points to `/dex:structure` when only the structure was named in the drift reason. Otherwise it points to `/dex:design`.
+   - `drift` takes `--target design|structure`. `next` points to that command.
    - `--slice` must name a checkpoint that exists.
 7. **Checkpoints.**
    - `finish-slice` requires the checkpoint to be in progress and `canImplement` to be true.
@@ -212,9 +301,25 @@ The approval should cover exactly what gets pushed, and it should not change whe
    - Checkpoint ids are normalised to `S<number>`, so `S01` becomes `S1`.
 8. **Flags need values.** A flag given without a value is an error, not the string `"true"`. Apply this to all flags, and add a helper in the argument parser.
 
-**Tests:** one per bullet, plus:
-- the path through drift, re-approval, automatic unblock, and `next`;
-- `strictGates: false` still blocks a PR when there is no design approval.
+### How to test step 4
+
+| Change | Test | Expected |
+|---|---|---|
+| `canImplement` checks | Start from a feature ready to implement. In separate tests: make the questions stale, delete the plan, block the feature. | `canImplement` is false each time, and the reason names the cause. |
+| `canPr` checks | Start from a feature ready for a PR. In separate tests: make the design stale, make the structure stale, delete the plan, delete the worktree folder, reopen a checkpoint, change code after verification, change code after review. | `canPr` is false each time, and its blocker list names the cause. `runGuard` with `git push` is denied each time. |
+| One-level staleness | Approve everything. Edit the questions and re-approve them. | Design STALE, with the reason "questions changed". Structure still APPROVED. |
+| … second level | Then edit the design and re-approve it. | Structure STALE. |
+| `strictGates: false` | Set it to `false`. Approve the design before the questions. Then skip the design approval entirely and drive to the PR. | The first approval is allowed. `canPr` is false, naming the design. |
+| Emptied file | Approve the design, then empty the file. | STALE, not MISSING. |
+| Drift needs re-approval | `drift feat --target design --reason "x"`, then `unblock`. | Refused. |
+| … and unblocks after it | `drift`, edit the design, then `runPromptHook('/dex:approve design feat')`. | Approved and unblocked. `next` is `/dex:implement`. |
+| Drift target | `drift --target structure`. | `next` is `/dex:structure`. |
+| Drift input checks | `drift --slice S9`; `drift --reason` with no value. | Both refused. |
+| `unblock` resets only its own checkpoints | Block S2 with `block-slice`. Drift on S1, re-approve. | S1 goes back to pending. S2 stays BLOCKED. |
+| Checkpoint rules | In turn: `finish-slice` without start; `finish-slice` while blocked; `set-slices` that drops S2; `set-slices` after S1 started; `set-slices S01 S1`. | All refused. The last is refused as a duplicate, because `S01` becomes `S1`. |
+| Flags need values | A table-driven test runs every command's flags with the value missing. | Each one fails with "flag --x needs a value". |
+
+Drift now takes `--target design|structure` instead of guessing from the reason text. Update the implement skill to pass it.
 
 ---
 
@@ -267,13 +372,32 @@ The approval should cover exactly what gets pushed, and it should not change whe
    - `/dex:doctor` reports whether the hook is installed.
 9. **Speed.** Set the hook timeout to 30 seconds. Publish commands are the only ones that compute the tree.
 
-**Tests:**
-- every bypass listed in findings 13 and 27;
-- every false denial listed in finding 26;
-- every path case in finding 14;
-- each tool the guard knows appears in the matcher;
-- the guard works when run through a symlinked plugin folder;
-- the `pre-push` hook blocks an unapproved `dex/*` push and allows an unrelated branch.
+### How to test step 5
+
+Most of step 5 is tested with tables: one row per command, all run by the same test loop.
+
+| Change | Test | Expected |
+|---|---|---|
+| `shell.mjs` | A unit table covering: quotes, escapes, heredocs, each operator, each redirect form, `$(…)`, backticks, `sh -c`, `bash -lc`, `eval`. | Each input gives the expected list of commands and redirects. |
+| Publish detection | A table of every command in finding 13 and every item in the Q7 publish list. Run each with `runGuard` twice: before code approval, and after full approval. | `deny` before approval. `allow` after it, except commands that are never allowed. This proves the guard isn't just blocking everything. |
+| No false publish matches | `git log --grep send-email`, `git push-to-checkout --help`, `echo "git push"`. | `allow`. |
+| Missed changes | A table of every command in finding 27, run during design. | `deny`. |
+| False denials | A table of every command in finding 26, run during design. | `allow`, except test logs written into the repo. |
+| Paths | A table of every path in finding 14, plus the two cases run from `src/`. | Each one is decided on where the file really lands. |
+| Symlink escape | Create `docs/dex/feat/link -> ../../../src`, then Write through it. | `deny`. |
+| Matcher | `staticText`: every tool name in the guard's tool sets matches the `hooks.json` matcher. | Pass. |
+| ApplyPatch | `runGuard` with a patch containing `*** Update File: src/A.java`, during design. | `deny`. |
+| MCP tools | `runGuard` with `mcp__fs__write_file`: first with `path: src/A.java`, then with `docs/dex/feat/x.md`. | `deny`, then `allow`. |
+| "Main script" check | Symlink the plugin folder, then run the guard through the link. Copy the plugin into a folder named `a#b` and run it from there. | The guard returns a decision in both cases. It is not silent. |
+| `pre-push` hook | Real git with a bare `origin`, after `install-hook`:<br>1. push `dex/feat` before approval;<br>2. push after approval;<br>3. push an unrelated branch. | 1 fails with Dex's message. 2 succeeds. 3 succeeds. |
+| … an existing hook | Install with a `pre-push` file already present. Then again with `core.hooksPath` set. | Both refuse, print the line to add, and leave the existing file unchanged. |
+| … doctor | Run `doctor` before and after installing. | "not installed", then "installed". |
+| Timeout | `staticText`: `hooks.json` sets a 30-second timeout. | Pass. |
+
+**Live checks** in `dex-sample`, in auto mode, before code approval:
+- Ask Claude to push. It is denied.
+- Ask Claude to "run `sh -c 'git push'`". It is denied.
+- Run `git push` yourself in a terminal from the worktree. The `pre-push` hook stops it.
 
 ---
 
@@ -304,11 +428,29 @@ The approval should cover exactly what gets pushed, and it should not change whe
    - Copy `<artifactRoot>/<slug>/*.md` into the worktree, then add, commit and push.
    - The artifact files are left out of the hash in step 3, so the approval still holds.
 
-**Tests:**
-- the skill-to-CLI test from step 0 is green;
-- the research result includes every question, with 8 questions and a limit of 6;
-- every dimension named in the review skill is a key in `review.js`;
-- no workflow reads `$CLAUDE_PLUGIN_ROOT`.
+### How to test step 6
+
+| Change | Test | Expected |
+|---|---|---|
+| Paths come in through `args` | `staticText`: no workflow contains `CLAUDE_PLUGIN_ROOT`. `runWorkflow('research.js', { stateScript: '/x/state.mjs', … })`. | Pass. The gate-check prompt contains `/x/state.mjs`. |
+| Skills use `scriptPath` | `staticText` on the research and review skills. | Both say `scriptPath`. |
+| Every question researched | `runWorkflow` with 8 questions, 2 Human Notes questions and `maxResearchWorkers: 6`. The fake agent counts how many calls are running at the same time. | All 10 questions are in the result. At most 6 run at once. |
+| Failed questions listed | The fake agent fails one probe. | That question is in `failedQuestions`, and the synthesis prompt lists it as unanswered. |
+| Probes are read-only | Inspect the options passed to the fake agent for each probe. | Each probe has agent type `research-probe`, or a tool list with no write tools. The prompt says to skip `docs/dex/**` and `.dex/**`. |
+| Review dimension names | `staticText`: every dimension key the review skill names exists in `review.js`. | Pass. |
+| Review gets verification | `runWorkflow('review.js', { verification: {…} })`. | The reviewer prompts contain the verification summary. |
+| Review sees new files | `runWorkflow('review.js', …)` in a repo with a new untracked file. | The diff command in the prompt uses `<baseSha>..<tree>`. |
+| Failure handling | `staticText`: both skills say to stop when `ok` is false, and not to write the report. | Pass. The live check confirms behaviour. |
+| Tracer line read | A structure that says `Tracer bullet required: YES`, with no tracer checkpoint. Then checkpoint ids that don't match the structure file. | `set-slices` warns both times. |
+| Tool name | Check the current name in the docs, then `staticText` over `allowed-tools`. | Only current tool names are used. |
+| `/dex:pr` includes the documents | Extend `e2e.test.mjs`: copy the artifacts into the worktree, commit, push to the bare `origin`. | The push succeeds. `git ls-tree origin/dex/feat` lists `docs/dex/feat/01-intent.md` and the other files. |
+
+**Live checks** in `dex-sample`, with a real feature from start to finish:
+- `/dex:research` writes `03-research.md` once, and it covers every question.
+- The transcript shows no probe reading `docs/dex/`.
+- `/dex:review` writes `08-review.md` once, and it mentions the verification result.
+- Break the research gate on purpose, for example by un-approving the questions. The skill stops and says why, and does not write the report itself.
+- `/dex:pr` opens a PR with the documents included. Use a throwaway GitHub repo, or check the pushed branch.
 
 ---
 
@@ -334,7 +476,21 @@ The approval should cover exactly what gets pushed, and it should not change whe
    - It checks whether folders are writable without creating them: test the nearest existing parent.
    - It reports features it cannot read.
 
-**Tests:** one per bullet.
+### How to test step 7
+
+| Change | Test | Expected |
+|---|---|---|
+| Secrets | A table of every leaked form in finding 24. Pass each one through `verification --command`, `finish-slice --note` and `drift --reason`. Then search both `events.jsonl` and `state.json` for the secret value. | Found in neither file. |
+| Scrub before truncating | A 395-character command that ends in a 40-character token. | No part of the token of 8 or more characters survives. |
+| Slug checks | A table of: `../x`, `Foo`, `a/b`, 61 characters, and an empty string, run through `approve`, `status` and `active`. | All refused. No folder is created: check the temp folder's parent before and after. |
+| Unicode titles | `init "日本語"`. | Refused, with a hint to give `--slug` or an English title. |
+| Reserved slugs | `init code`, then `init design`. | Both refused. |
+| Argument order | `approve feat design`. | Refused, with the correct order shown. |
+| Empty lock | Create an empty `.lock` with the current modification time, then run a command. Repeat with a modification time 5 minutes old. | The first waits, then fails with "locked". The second reclaims the lock. |
+| Future-dated lock | A lock with `acquiredAt` in the future. | Reclaimed. |
+| Concurrent `init` | Start two `init feat` processes at the same moment, 20 times. | Exactly one succeeds each time. |
+| Doctor writes nothing | Run `doctor` in a repo without `.dex/`. | Still no `.dex/` or `docs/dex/` afterwards. |
+| Doctor sees corrupt state | Corrupt one `state.json`, then run `doctor`. | It reports that feature as unreadable, and exits 1. |
 
 ---
 
@@ -351,10 +507,29 @@ The approval should cover exactly what gets pushed, and it should not change whe
 3. `CHANGELOG.md`: add a new version entry that lists the fixed findings.
 4. `review-findings.md`: mark each finding as fixed, with the commit that fixed it.
 
+### How to test step 8
+
+| Change | Test | Expected |
+|---|---|---|
+| Plugin still valid | `claude plugin validate --strict ./dex`. | Pass. |
+| README command list | `staticText`: every folder in `skills/` appears in the README's command table, and nothing else does. | Pass. |
+| `state.mjs help` | Every command documented in the README appears in `state.mjs help`. | Pass. |
+| Findings file | Every finding from 1 to 30 is marked fixed with a commit hash, and names at least one test. | You check this by reading. |
+
+---
+
+## Release check
+
+Do this after step 8, before calling the work done.
+
+1. `node --test dex/tests/*.test.mjs`. Everything is green, and no test is marked skipped or expected-to-fail.
+2. In `dex-sample`, run one small feature through every command, from `/dex:start` to `/dex:pr`, in auto mode. Every live check in `LIVE-CHECKS.md` is ticked with a date.
+3. Re-run the three adversarial reviews from the original findings, pointed at the new code. Anything they confirm becomes a new finding, not a silent fix.
+
 ---
 
 ## Risks
 
-- **Step 0 may rule out the approval hook.** If the message-submit hook can't see what you typed, approval moves to your own terminal only. That is safe, but adds friction.
+- ~~**Step 0 may rule out the approval hook.**~~ Resolved on 2026-09-28: the hook receives the raw typed text. See `dex/NOTES.md`.
 - **Pattern matching will still miss some interpreter tricks,** such as `python -c` writing files. The `pre-push` hook covers publishing to git. Direct file writes by interpreters before implementation starts remain a known gap. The README must say so.
 - **Step 3 changes what an approval is.** Approvals recorded before the upgrade will show as STALE. Bump `schemaVersion` to 2 and have `state.mjs` explain this, rather than refusing to load old state.
