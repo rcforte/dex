@@ -26,6 +26,7 @@ const slug = input.slug || 'unknown-feature'
 const base = input.base || ''
 const worktree = input.worktree || '.'
 const artifactRoot = input.artifactRoot || 'docs/dex'
+const stateRoot = input.stateRoot || '.dex'
 const reviewPath = input.reviewPath || `${artifactRoot}/${slug}/08-review.md`
 const intentPath = `${artifactRoot}/${slug}/01-intent.md`
 const designPath = `${artifactRoot}/${slug}/04-design.md`
@@ -169,7 +170,7 @@ const scope = await agent(
     'Inspect it with:',
     `  ${diffCommands}`,
     '',
-    `Ignore changes under ${artifactRoot}/ and .dex/ — those are Dex's own documents, not production code.`,
+    `Ignore changes under ${artifactRoot}/ and ${stateRoot}/ — those are Dex's own documents, not production code.`,
     '',
     'Return a short factual summary of what changed, the list of changed and new files,',
     'and which of these sensitive areas the change touches: public API or boundary,',
@@ -205,7 +206,7 @@ const sharedContext = [
   'Inspect the change with:',
   `  ${diffCommands}`,
   '',
-  `Ignore changes under ${artifactRoot}/ and .dex/.`,
+  `Ignore changes under ${artifactRoot}/ and ${stateRoot}/.`,
   '',
   'What the change does, for orientation:',
   scope.summary || '(no summary available)',

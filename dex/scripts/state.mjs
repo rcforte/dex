@@ -28,7 +28,7 @@
  *   node state.mjs active [<slug>]
  *   node state.mjs list
  *   node state.mjs config
- *   node state.mjs diff-hash [<slug>]
+ *   node state.mjs diff-hash [<slug>]      print the tree the code approval would cover
  */
 
 import fs from 'node:fs'
@@ -41,7 +41,10 @@ import {
   artifactDir,
   currentBranch,
   detectBaseBranch,
-  diffFingerprint,
+  commitTree,
+  headTree,
+  mergeBase,
+  workTree,
   ensureConfig,
   featureStateDir,
   findRepoRoot,
@@ -131,28 +134,52 @@ function approvalStatus(root, state, gateKey, artifactKey) {
   return { status: GATE.APPROVED, stale: false, approved: true, approvedAt: approval.approvedAt, artifactHash: current }
 }
 
+/** The checkout the feature's code lives in: its worktree, or the main checkout. */
+export function featureDir(root, state) {
+  return state.worktree?.path && fs.existsSync(state.worktree.path) ? state.worktree.path : root
+}
+
 /**
- * Evaluate the human code approval, which binds to a diff fingerprint rather
- * than a file. Recomputed from the working tree every time it is asked about.
+ * Evaluate the human code approval. It binds to the git tree of the feature's
+ * checkout (see workTree in lib.mjs), recomputed every time it is asked about.
  */
-function codeApprovalStatus(root, config, state) {
+function codeApprovalStatus(state, currentTree) {
   const approval = state.approvals.humanCodeReview
   if (!approval || !approval.approved) {
     return { status: GATE.REQUIRED, stale: false, approved: false, reason: 'a human has not approved the production diff' }
   }
-  const cwd = state.worktree?.path && fs.existsSync(state.worktree.path) ? state.worktree.path : root
-  const fp = diffFingerprint(cwd, approval.base ?? state.worktree?.base ?? null, config)
-  if (fp.hash !== approval.diffHash) {
+  if (currentTree === undefined) {
+    // The caller asked for gates without computing trees (the guard, for a call
+    // that is not a publish). Report the record; nothing here grants a push.
+    return { status: GATE.APPROVED, stale: false, approved: true, unchecked: true, approvedAt: approval.approvedAt }
+  }
+  if (!approval.tree) {
     return {
       status: GATE.STALE,
       stale: true,
       approved: false,
-      approvedHash: approval.diffHash,
-      currentHash: fp.hash,
-      reason: 'the production diff changed after human approval',
+      reason: 'this approval was recorded by an older Dex that hashed diffs differently; read the diff and approve again',
     }
   }
-  return { status: GATE.APPROVED, stale: false, approved: true, approvedAt: approval.approvedAt, diffHash: fp.hash }
+  if (currentTree !== approval.tree) {
+    return {
+      status: GATE.STALE,
+      stale: true,
+      approved: false,
+      approvedTree: approval.tree,
+      currentTree,
+      reason: 'the production code changed after human approval',
+    }
+  }
+  return { status: GATE.APPROVED, stale: false, approved: true, approvedAt: approval.approvedAt, tree: approval.tree, baseSha: approval.baseSha }
+}
+
+/** A recorded result (verification or AI review) still applies only to the code it checked. */
+function resultStillApplies(record, currentTree) {
+  // undefined: trees were not computed. null: not a git repository, so there is
+  // nothing to compare against and the record stands as written.
+  if (currentTree === undefined || currentTree === null) return true
+  return Boolean(record?.tree) && record.tree === currentTree
 }
 
 function sliceSummary(state) {
@@ -175,8 +202,17 @@ function sliceSummary(state) {
  * The complete gate report. Everything downstream — status output, `next`, the
  * PreToolUse guard, the PR gate — reads this and nothing else.
  */
-export function computeGates(root, config, state) {
+export function computeGates(root, config, state, { trees = true } = {}) {
   const g = {}
+  const dir = featureDir(root, state)
+  const slug = state.feature.slug
+  let treeCache
+  // undefined means "not computed": the caller did not ask for tree checks.
+  const currentTree = () => {
+    if (!trees) return undefined
+    if (treeCache === undefined) treeCache = workTree(dir, config, slug)
+    return treeCache
+  }
   g.intent = { status: artifactExists(root, state, 'intent') ? GATE.COMPLETE : GATE.MISSING }
   g.questions = approvalStatus(root, state, 'questions', 'questions')
   g.research = { status: artifactExists(root, state, 'research') ? GATE.COMPLETE : GATE.NOT_RUN }
@@ -194,25 +230,34 @@ export function computeGates(root, config, state) {
   g.implementation = sliceSummary(state)
 
   const v = state.verification || {}
+  const vRan = v.status === 'passed' || v.status === 'failed'
+  const vCurrent = vRan && resultStillApplies(v, currentTree())
   g.verification = {
-    status: v.status === 'passed' ? GATE.PASS : v.status === 'failed' ? GATE.FAIL : GATE.NOT_RUN,
+    status: !vRan || !vCurrent ? GATE.NOT_RUN : v.status === 'passed' ? GATE.PASS : GATE.FAIL,
     commands: v.commands || [],
     ranAt: v.ranAt || null,
+    ...(vRan && !vCurrent ? { reason: 'the code changed after verification ran' } : {}),
   }
 
   const r = state.aiReview || {}
+  const rCurrent = r.status === 'completed' && resultStillApplies(r, currentTree())
   if (!config.requireAiReview) {
     g.aiReview = { status: GATE.NOT_REQUIRED, satisfied: true, blockers: 0 }
-  } else if (r.status === 'completed' && r.conclusion === 'pass') {
+  } else if (rCurrent && r.conclusion === 'pass') {
     g.aiReview = { status: GATE.PASS, satisfied: true, blockers: r.blockers || 0 }
-  } else if (r.status === 'completed') {
+  } else if (rCurrent) {
     g.aiReview = { status: GATE.REMEDIATION, satisfied: false, blockers: r.blockers || 0 }
   } else {
-    g.aiReview = { status: GATE.NOT_RUN, satisfied: false, blockers: 0 }
+    g.aiReview = {
+      status: GATE.NOT_RUN,
+      satisfied: false,
+      blockers: 0,
+      ...(r.status === 'completed' ? { reason: 'the code changed after the AI review ran' } : {}),
+    }
   }
 
   g.humanCodeReview = config.requireHumanCodeApproval
-    ? codeApprovalStatus(root, config, state)
+    ? codeApprovalStatus(state, currentTree())
     : { status: GATE.NOT_REQUIRED, approved: true, stale: false }
 
   // --- Derived permissions -------------------------------------------------
@@ -237,12 +282,26 @@ export function computeGates(root, config, state) {
   }
   if (g.verification.status !== GATE.PASS) prBlockers.push(`verification is ${g.verification.status}`)
   if (!g.aiReview.satisfied) prBlockers.push(`AI review is ${g.aiReview.status}`)
-  if (config.requireAiReview && (state.aiReview?.blockers || 0) > 0) {
+  if (config.requireAiReview && rCurrent && (state.aiReview?.blockers || 0) > 0) {
     prBlockers.push(`${state.aiReview.blockers} unresolved BLOCKER finding(s) in the AI review`)
   }
   if (!g.humanCodeReview.approved) prBlockers.push(`human code review is ${g.humanCodeReview.status}`)
   if (state.blocked) prBlockers.push(`feature is blocked: ${state.blocked.reason}`)
   g.canPr = { allowed: prBlockers.length === 0, blockers: prBlockers }
+
+  // Publishing needs one more thing: HEAD must hold exactly the approved code,
+  // so what leaves the machine is what the human read. Only computed with trees.
+  if (trees) {
+    const publishBlockers = [...prBlockers]
+    if (g.canPr.allowed && config.requireHumanCodeApproval) {
+      if (headTree(dir, config, slug) !== state.approvals.humanCodeReview.tree) {
+        publishBlockers.push(
+          'HEAD does not hold exactly the approved code. Commit the approved changes, and nothing else, then push.'
+        )
+      }
+    }
+    g.canPublish = { allowed: publishBlockers.length === 0, blockers: publishBlockers }
+  }
 
   g.staleApprovals = ['questions', 'design', 'structure', 'humanCodeReview'].filter((k) => g[k]?.stale)
 
@@ -603,44 +662,52 @@ COMMANDS.approve = (ctx, argv) => {
             `Run:\n  /dex:verify ${slug}`
         )
       }
-      const cwd = state.worktree?.path && fs.existsSync(state.worktree.path) ? state.worktree.path : root
+      const cwd = featureDir(root, state)
       if (!isGitRepo(cwd)) {
         throw new DexError(
-          `Dex cannot fingerprint the production diff because ${cwd} is not a git repository.\n\n` +
-            `Human code approval is bound to a diff hash. Without git there is nothing to bind to.\n\n` +
+          `Dex cannot record the code approval because ${cwd} is not a git repository.\n\n` +
+            `Human code approval is bound to a git tree. Without git there is nothing to bind to.\n\n` +
             `Initialize the repository, or set "requireHumanCodeApproval": false in ${normalizeRelPath(config.__path, root)} and accept that Dex stops enforcing this gate.`
         )
       }
-      const base = state.worktree?.base || detectBaseBranch(cwd)
-      const fp = diffFingerprint(cwd, base, config)
-      if (!fp.hash) throw new DexError(`Dex could not compute a diff fingerprint (${fp.reason}).`)
-      if (fp.trackedBytes === 0 && fp.untrackedCount === 0) {
+      const baseSha = state.worktree?.baseSha || mergeBase(cwd, state.worktree?.base)
+      if (!baseSha) {
         throw new DexError(
-          `There is no production diff to approve against base "${fp.base ?? '(none)'}".\n\n` +
+          `Dex cannot record the code approval because it does not know the base commit the feature started from.\n\n` +
+            `Without a base there is no way to show exactly what changed.\n\n` +
+            `Record the worktree with its base branch:\n  node state.mjs record-worktree ${slug} <branch> <path> --base <base-branch>`
+        )
+      }
+      const tree = workTree(cwd, config, slug)
+      if (!tree) throw new DexError(`Dex could not compute the tree of ${cwd}.`)
+      if (tree === commitTree(cwd, baseSha)) {
+        throw new DexError(
+          `There is no production diff to approve against the base commit ${baseSha.slice(0, 12)}.\n\n` +
             `Dex refuses to record an approval of an empty change.\n\n` +
-            `Check:\n  git -C ${cwd} status\n  git -C ${cwd} diff ${fp.base ?? ''}`
+            `Check:\n  git -C ${cwd} status`
         )
       }
       state.approvals.humanCodeReview = {
         approved: true,
         approvedAt: nowIso(),
-        diffHash: fp.hash,
-        base: fp.base,
+        tree,
+        baseSha,
         worktree: state.worktree?.path || null,
       }
       const gates = refreshPhase(root, config, state)
       saveFeatureState(root, config, slug, state)
-      appendEvent(root, config, slug, 'human_code_review_approved', { diffHash: fp.hash, base: fp.base })
+      appendEvent(root, config, slug, 'human_code_review_approved', { tree, baseSha })
       const next = nextAction(root, config, state, gates)
       return {
         text:
           `APPROVED: human code review\n` +
           `Feature:   ${slug}\n` +
-          `Base:      ${fp.base ?? '(none)'}\n` +
-          `Diff SHA-256: ${fp.hash}\n\n` +
-          `This approval is bound to that diff. Any further production change voids it.\n\n` +
+          `Base:      ${baseSha}\n` +
+          `Tree:      ${tree}\n\n` +
+          `This approval covers exactly:\n  git -C ${cwd} diff ${baseSha} ${tree}\n\n` +
+          `Any further production change voids it. Staging and committing do not.\n\n` +
           `Next: ${next.command ?? '(nothing)'}`,
-        json: { gate: 'humanCodeReview', diffHash: fp.hash, base: fp.base, next },
+        json: { gate: 'humanCodeReview', tree, baseSha, next },
       }
     }
 
@@ -820,6 +887,24 @@ function findSlice(state, id) {
   return slice
 }
 
+/** Record the commit the feature started from, so every diff has a fixed base. */
+function pinBase(state, dir, baseRef) {
+  const sha = mergeBase(dir, baseRef)
+  if (!sha) return
+  state.worktree = { ...(state.worktree || {}), base: baseRef, baseSha: sha }
+}
+
+/** Verification and AI review describe finished code, so they wait for every checkpoint. */
+function requireAllSlicesComplete(state, what) {
+  const open = (state.slices || []).filter((s) => s.status !== 'complete').map((s) => s.id)
+  if (!(state.slices || []).length || open.length) {
+    throw new DexError(
+      `Dex will not record ${what} yet: ${open.length ? `checkpoint(s) ${open.join(', ')} are not complete` : 'no checkpoints are recorded'}.\n\n` +
+        `It has to describe the finished code. Finish the checkpoints first:\n  /dex:implement ${state.feature.slug}`
+    )
+  }
+}
+
 COMMANDS['start-slice'] = (ctx, argv) => {
   const { rest } = parseFlags(argv)
   const slug = requireSlug(rest[0], 'start-slice')
@@ -838,6 +923,7 @@ COMMANDS['start-slice'] = (ctx, argv) => {
     const earlierIncomplete = (state.slices || []).filter(
       (s) => s.status !== 'complete' && Number(s.id.slice(1)) < Number(slice.id.slice(1))
     )
+    if (!config.requireWorktree && !state.worktree?.baseSha) pinBase(state, root, detectBaseBranch(root))
     slice.status = 'in-progress'
     slice.startedAt = nowIso()
     refreshPhase(root, config, state)
@@ -940,6 +1026,7 @@ COMMANDS.verification = (ctx, argv) => {
     if (result === 'reset') {
       state.verification = { status: 'not-run', commands: [], lastResult: null, ranAt: null }
     } else {
+      requireAllSlicesComplete(state, 'verification')
       if (!commands.length) {
         throw new DexError(
           `Dex will not record verification ${result} with no commands.\n\n` +
@@ -960,6 +1047,7 @@ COMMANDS.verification = (ctx, argv) => {
         commands,
         lastResult: typeof flags.summary === 'string' ? String(flags.summary).slice(0, 2000) : null,
         ranAt: nowIso(),
+        tree: workTree(featureDir(root, state), config, slug),
       }
     }
     const gates = refreshPhase(root, config, state)
@@ -992,12 +1080,14 @@ COMMANDS['record-review'] = (ctx, argv) => {
     if (conclusion === 'pass' && blockers > 0) {
       throw new DexError(`An AI review with ${blockers} BLOCKER finding(s) cannot conclude PASS. Record it as remediation-required.`)
     }
+    requireAllSlicesComplete(state, 'the AI review')
     state.aiReview = {
       status: 'completed',
       conclusion,
       blockers,
       high: flags.high === undefined ? null : Number(flags.high),
       completedAt: nowIso(),
+      tree: workTree(featureDir(root, state), config, slug),
     }
     const gates = refreshPhase(root, config, state)
     saveFeatureState(root, config, slug, state)
@@ -1081,7 +1171,7 @@ COMMANDS['record-worktree'] = (ctx, argv) => {
     checkWorktree(root, abs, branch)
     const base = typeof flags.base === 'string' ? flags.base : detectBaseBranch(abs) || null
     checkBase(abs, base, branch)
-    state.worktree = { ready: true, branch, path: abs, base }
+    state.worktree = { ready: true, branch, path: abs, base, baseSha: mergeBase(abs, base) }
     const gates = refreshPhase(root, config, state)
     saveFeatureState(root, config, slug, state)
     appendEvent(root, config, slug, 'worktree_created', { branch, path: abs, base: state.worktree.base })
@@ -1224,21 +1314,16 @@ COMMANDS.config = (ctx) => {
 }
 
 COMMANDS['diff-hash'] = (ctx, argv) => {
-  const { flags, rest } = parseFlags(argv)
+  const { rest } = parseFlags(argv)
   const { root, config } = ctx
-  const slug = rest[0] || readActiveSlug(root, config)
-  let cwd = root
-  let base = typeof flags.base === 'string' ? flags.base : null
-  if (slug) {
-    const state = loadFeatureState(root, config, slug)
-    if (state.worktree?.path && fs.existsSync(state.worktree.path)) cwd = state.worktree.path
-    base = base || state.worktree?.base || null
-  }
-  base = base || detectBaseBranch(cwd)
-  const fp = diffFingerprint(cwd, base, config)
+  const slug = requireSlug(rest[0] || readActiveSlug(root, config), 'diff-hash')
+  const state = loadFeatureState(root, config, slug)
+  const dir = featureDir(root, state)
+  const tree = workTree(dir, config, slug)
+  const baseSha = state.worktree?.baseSha || null
   return {
-    text: `cwd:   ${cwd}\nbase:  ${fp.base ?? '(none)'}\nhash:  ${fp.hash ?? '(none)'}\ntracked diff bytes: ${fp.trackedBytes ?? 0}\nuntracked files:    ${fp.untrackedCount ?? 0}`,
-    json: fp,
+    text: `dir:    ${dir}\nbase:   ${baseSha ?? '(not pinned)'}\ntree:   ${tree ?? '(none)'}` + (baseSha && tree ? `\n\nRead it:\n  git -C ${dir} diff ${baseSha} ${tree}` : ''),
+    json: { dir, baseSha, tree },
   }
 }
 

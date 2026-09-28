@@ -279,9 +279,18 @@ test('re-recording checkpoints preserves completed progress', async () => {
 // Verification honesty
 // ---------------------------------------------------------------------------
 
+/** Finish both checkpoints, so verification and review may be recorded (Q8). */
+async function finishSlices(root) {
+  for (const id of ['S1', 'S2']) {
+    await state(root, ['start-slice', 'feat', id])
+    await state(root, ['finish-slice', 'feat', id, '--verification', 'mvn test'])
+  }
+}
+
 test('verification PASS is refused when any command exited non-zero', async () => {
   const root = makeRepo()
   await advanceTo(root, 'feat', 'worktree')
+  await finishSlices(root)
   const msg = await stateFails(root, ['verification', 'feat', 'pass', '--command', 'mvn test', '--exit', '1'])
   assert.match(msg, /refuses to record verification PASS/)
   assert.match(msg, /outranks any model's judgment/)
@@ -290,12 +299,14 @@ test('verification PASS is refused when any command exited non-zero', async () =
 test('verification requires at least one command', async () => {
   const root = makeRepo()
   await advanceTo(root, 'feat', 'worktree')
+  await finishSlices(root)
   assert.match(await stateFails(root, ['verification', 'feat', 'pass']), /will not record verification pass with no commands/)
 })
 
 test('verification results persist with exit codes', async () => {
   const root = makeRepo()
   await advanceTo(root, 'feat', 'worktree')
+  await finishSlices(root)
   await state(root, [
     'verification', 'feat', 'pass',
     '--commands-json', '[{"command":"./gradlew test","exitCode":0,"category":"unit"},{"command":"./gradlew check","exitCode":0,"category":"lint"}]',
@@ -364,14 +375,14 @@ test('unresolved BLOCKER findings block the PR', async () => {
 // Human code approval and its diff fingerprint
 // ---------------------------------------------------------------------------
 
-test('human code approval binds to a diff hash, and changing the diff makes it stale', async () => {
+test('human code approval binds to a git tree, and changing the code makes it stale', async () => {
   const root = makeRepo()
   const { worktree } = await advanceTo(root, 'feat', 'worktree')
   await completeImplementation(root, 'feat', worktree)
 
   const approved = await state(root, ['approve', 'feat', 'code'])
-  assert.match(approved.json.diffHash, /^[0-9a-f]{64}$/)
-  assert.equal(approved.json.base, 'main')
+  assert.match(approved.json.tree, /^[0-9a-f]{40}$/)
+  assert.equal(approved.json.baseSha, gitIn(worktree, ['merge-base', 'main', 'HEAD']).trim())
   assert.match(approved.text, /Any further production change voids it/)
 
   let check = await state(root, ['check', 'feat'])
@@ -707,7 +718,7 @@ test('code approval is refused outside a git repository', async () => {
   await state(root, ['verification', 'feat', 'pass', '--command', 'mvn test', '--exit', '0'])
   const msg = await stateFails(root, ['approve', 'feat', 'code'])
   assert.match(msg, /is not a git repository/)
-  assert.match(msg, /bound to a diff hash/)
+  assert.match(msg, /bound to a git tree/)
 })
 
 test('a state file from a different schema version is refused, not guessed at', async () => {
@@ -773,6 +784,7 @@ test('secret-shaped values are scrubbed from the event log, not just secret-name
 test('a recorded verification command reaches the event log already scrubbed', async () => {
   const root = makeRepo()
   await advanceTo(root, 'feat', 'worktree')
+  await finishSlices(root)
   await state(root, [
     'verification', 'feat', 'pass',
     '--command', 'curl -sf -H "Authorization: Bearer ghp_ABCDEFGH12345678abcdefgh" http://localhost:8080/health',

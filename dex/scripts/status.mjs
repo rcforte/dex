@@ -23,16 +23,19 @@ import {
   loadConfig,
   loadFeatureState,
   readActiveSlug,
+  workTree,
 } from './lib.mjs'
-import { computeGates, nextAction, renderStatus } from './state.mjs'
+import { computeGates, featureDir, nextAction, renderStatus } from './state.mjs'
 
 /**
  * The human code-review helper. Dex cannot read code for the engineer, so it
  * hands over an ordered, concrete reading list instead of a vague instruction.
  */
 function reviewGuide(root, config, state) {
-  const cwd = state.worktree?.path && fs.existsSync(state.worktree.path) ? state.worktree.path : root
-  const base = state.worktree?.base || ''
+  const cwd = featureDir(root, state)
+  const slug = state.feature.slug
+  const baseSha = state.worktree?.baseSha || null
+  const tree = baseSha ? workTree(cwd, config, slug) : null
   const lines = []
   lines.push('')
   lines.push('READ THE PRODUCTION CODE')
@@ -40,25 +43,28 @@ function reviewGuide(root, config, state) {
   lines.push('Dex cannot do this part. AI review and green tests are supplemental evidence;')
   lines.push('they are not an approval. Start with shape, then read every changed file.')
   lines.push('')
-  lines.push(`  git -C ${cwd} diff --stat ${base}`.trimEnd())
-  lines.push(`  git -C ${cwd} diff ${base}`.trimEnd())
+  if (!baseSha || !tree) {
+    lines.push('Dex does not know the base commit yet, so it cannot show the diff.')
+    lines.push(`Record the worktree first: /dex:worktree ${slug}`)
+    return lines.join('\n')
+  }
+  lines.push('This is exactly what /dex:approve code will cover:')
+  lines.push('')
+  lines.push(`  git -C ${cwd} diff --stat ${baseSha} ${tree}`)
+  lines.push(`  git -C ${cwd} diff ${baseSha} ${tree}`)
   lines.push('')
 
-  if (isGitRepo(cwd)) {
-    const nameStatus = git(['--no-pager', 'diff', '--name-status', ...(base ? [base] : []), '--', '.'], { cwd, allowFail: true }) ?? ''
-    const untracked = git(['--no-pager', 'ls-files', '--others', '--exclude-standard'], { cwd, allowFail: true }) ?? ''
-    const changed = nameStatus
+  {
+    const nameStatus = git(['--no-pager', 'diff', '--name-status', '-M', baseSha, tree], { cwd, allowFail: true }) ?? ''
+    const entries = nameStatus
       .split('\n')
       .filter(Boolean)
       .map((l) => {
-        const [st, ...rest] = l.split(/\t/)
-        return { status: st, file: rest.join(' -> ') }
+        const [st, ...files] = l.split(/\t/)
+        return { status: st, files }
       })
-      .filter((c) => !c.file.startsWith(config.artifactRoot) && !c.file.startsWith(config.stateRoot))
-    const newFiles = untracked
-      .split('\n')
-      .filter(Boolean)
-      .filter((f) => !f.startsWith(config.artifactRoot) && !f.startsWith(config.stateRoot))
+    const changed = entries.filter((e) => !e.status.startsWith('A')).map((e) => ({ status: e.status, file: e.files.join(' -> ') }))
+    const newFiles = entries.filter((e) => e.status.startsWith('A')).map((e) => e.files[0])
 
     // Buckets that historically hide the expensive mistakes.
     const sensitive = {
@@ -87,12 +93,12 @@ function reviewGuide(root, config, state) {
       lines.push('  - Would I have written this, and would I defend it in review?')
       lines.push('  - What is NOT here that should be?')
     } else {
-      lines.push(`No production changes detected against base "${base || '(none)'}".`)
+      lines.push(`No production changes against the base commit ${baseSha}.`)
     }
   }
   lines.push('')
   lines.push(`When you have actually read it:`)
-  lines.push(`  /dex:approve code ${state.feature.slug}`)
+  lines.push(`  /dex:approve code ${slug}`)
   return lines.join('\n')
 }
 

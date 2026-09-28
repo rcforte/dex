@@ -22,7 +22,7 @@ Proceed only when `gates.canPr.allowed` is true. It requires:
 - verification PASS
 - AI review completed with no unresolved BLOCKER findings, when required
 - human code review APPROVED
-- that approval's diff fingerprint still current
+- that approval's tree still current
 
 If blocked, print the blockers verbatim and stop. The PreToolUse guard refuses the
 push independently, so there is nothing to gain by trying.
@@ -37,7 +37,7 @@ Use `${CLAUDE_PLUGIN_ROOT}/templates/pr.md`, written to `09-pr.md`.
 
 Include: summary, links to intent, design and structure, the checkpoint list, the
 verification table with real exit codes, the AI review conclusion, the human code
-approval diff hash from state, risk, and rollback.
+approved tree and base commit from state, risk, and rollback.
 
 The hash matters. It records exactly which diff a human read and approved.
 

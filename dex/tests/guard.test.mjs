@@ -304,10 +304,12 @@ test('push and PR creation are DENIED before human code approval', async () => {
   }
 })
 
-test('push is ALLOWED once every PR gate is satisfied', async () => {
+test('push is ALLOWED once every PR gate is satisfied and the approved code is committed', async () => {
   const ctx = await ctxAt('worktree')
   await completeImplementation(ctx.root, 'feat', ctx.worktree)
   await state(ctx.root, ['approve', 'feat', 'code'])
+  execFileSync('git', ['add', '-A'], { cwd: ctx.worktree })
+  execFileSync('git', ['commit', '-qm', 'feature'], { cwd: ctx.worktree })
   ctx.refresh()
 
   assert.equal(ctx.feature.gates.canPr.allowed, true)

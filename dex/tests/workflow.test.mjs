@@ -424,7 +424,7 @@ test('all nine artifact templates exist and are non-trivial', () => {
     'plan.md': /### Stop Conditions/,
     'implementation-log.md': /## DESIGN DRIFT/,
     'review.md': /AI REVIEW DOES NOT REPLACE HUMAN CODE REVIEW/,
-    'pr.md': /Approved against diff SHA-256/,
+    'pr.md': /Approved code: `git diff <baseSha> <tree>`/,
   }
   for (const [file, marker] of Object.entries(templates)) {
     const abs = path.join(PLUGIN_ROOT, 'templates', file)

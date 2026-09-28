@@ -333,17 +333,19 @@ export function decide({ toolName, toolInput, root, config, feature, ambiguous =
 
   // --- Publish gate: applies in every phase ------------------------------
   if (publishHit) {
-    if (gates.canPr.allowed) return allow('all pull-request gates satisfied')
+    // canPublish is only present when the gates were computed with tree checks.
+    // Without it, Dex has not verified what would be pushed, so it refuses.
+    const gate = gates.canPublish ?? { allowed: false, blockers: ['Dex did not check the code that would be pushed'] }
+    if (gate.allowed) return allow('all publish gates satisfied')
     return denial(
       `Dex blocked ${publishHit.what} for feature "${slug}".\n\n` +
         `Unsatisfied requirements:\n` +
-        gates.canPr.blockers.map((b) => `  - ${b}`).join('\n') +
+        gate.blockers.map((b) => `  - ${b}`).join('\n') +
         `\n\n` +
         (gates.humanCodeReview.approved
           ? ''
           : `A human has to read the production diff. AI review and passing tests do not substitute for that.\n\n` +
-            `  git -C ${worktreePath ?? root} diff --stat ${state.worktree?.base ?? ''}\n` +
-            `  git -C ${worktreePath ?? root} diff ${state.worktree?.base ?? ''}\n\n` +
+            `  node <path-to-dex>/scripts/status.mjs ${slug} --review\n\n` +
             `Then:\n  /dex:approve code ${slug}\n\n`) +
         `Full state:\n  /dex:status ${slug}`
     )
@@ -486,7 +488,9 @@ export function evaluateHookInput(payload, { cwd = process.cwd() } = {}) {
     return decide({ ...base, config: DEFAULT_CONFIG, feature: null, lockdown: `Dex could not read its config.\n\n${firstLine(err)}` })
   }
   const resolved = resolveActiveFeature(root, config)
-  const gatesFor = (f) => ({ slug: f.slug, state: f.state, gates: computeGates(root, config, f.state) })
+  // Hashing the working tree is the expensive part; only a publish needs it.
+  const trees = isPublish(toolName, toolInput)
+  const gatesFor = (f) => ({ slug: f.slug, state: f.state, gates: computeGates(root, config, f.state, { trees }) })
 
   if (resolved.unreadable.length) {
     return decide({
@@ -519,6 +523,12 @@ export function evaluateHookInput(payload, { cwd = process.cwd() } = {}) {
     ambiguous: resolved.ambiguous,
     candidates: resolved.candidates,
   })
+}
+
+function isPublish(toolName, toolInput) {
+  if (!SHELL_TOOLS.has(toolName)) return false
+  const command = String(toolInput?.command ?? toolInput?.script ?? '')
+  return splitSegments(command).some((seg) => PUBLISH_PATTERNS.some((p) => p.re.test(seg)))
 }
 
 function firstLine(err) {

@@ -33,7 +33,7 @@ Unresolved findings:
 
 ## Human Code Review
 
-Approved against diff SHA-256: `<hash>`
+Approved code: `git diff <baseSha> <tree>` (base `<baseSha>`, tree `<tree>`)
 
 ## Risk
 

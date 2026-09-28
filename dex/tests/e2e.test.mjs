@@ -87,7 +87,7 @@ test('finding 3: a push from the worktree before code approval is denied', async
   assert.equal(guardBash(wt, `git push -u origin dex/${SLUG}`).decision, 'deny')
 })
 
-test('findings 3 and 4: the documented flow ends with an allowed push', { todo: 'fixed in step 3' }, async () => {
+test('findings 3 and 4: the documented flow ends with an allowed push', async () => {
   const root = makeRepo({ origin: true })
   await planned(root)
   const wt = await worktree(root)

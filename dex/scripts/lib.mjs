@@ -331,6 +331,16 @@ export function writeFileAtomic(absPath, text) {
  * Unknown keys never change behavior; they are reported as warnings so a typo
  * like "requireHumanCodeReview" cannot silently disable a gate.
  */
+/**
+ * A relative path that names a real subfolder of the repository: not absolute,
+ * not the repository itself, and never climbing out of it with `..`.
+ */
+function isContainedRelPath(p) {
+  if (typeof p !== 'string' || !p.trim() || path.isAbsolute(p) || /^[A-Za-z]:/.test(p)) return false
+  const norm = path.posix.normalize(p.replace(/\\/g, '/')).replace(/\/+$/, '')
+  return norm !== '.' && norm !== '' && norm !== '..' && !norm.startsWith('../')
+}
+
 export function loadConfig(root, { stateRoot = '.dex' } = {}) {
   const configPath = path.join(root, stateRoot, 'config.json')
   const raw = readJson(configPath, null)
@@ -372,8 +382,8 @@ export function loadConfig(root, { stateRoot = '.dex' } = {}) {
     config.maxResearchWorkers = DEFAULT_CONFIG.maxResearchWorkers
   }
   for (const key of ['artifactRoot', 'stateRoot']) {
-    if (typeof config[key] !== 'string' || !config[key].trim() || path.isAbsolute(config[key])) {
-      warnings.push(`config "${key}" must be a non-empty relative path; using default "${DEFAULT_CONFIG[key]}"`)
+    if (!isContainedRelPath(config[key])) {
+      warnings.push(`config "${key}" must be a folder inside the repository, such as "${DEFAULT_CONFIG[key]}"; using the default`)
       config[key] = DEFAULT_CONFIG[key]
     }
   }
@@ -725,12 +735,13 @@ export function resolveActiveFeature(root, config) {
 // Git
 // ---------------------------------------------------------------------------
 
-export function git(args, { cwd = process.cwd(), allowFail = false, maxBuffer = 64 * 1024 * 1024 } = {}) {
+export function git(args, { cwd = process.cwd(), allowFail = false, maxBuffer = 64 * 1024 * 1024, env = undefined } = {}) {
   try {
     return execFileSync('git', args, {
       cwd,
       encoding: 'utf8',
       maxBuffer,
+      env,
       stdio: ['ignore', 'pipe', 'pipe'],
     })
   } catch (err) {
@@ -776,54 +787,76 @@ export function detectBaseBranch(cwd) {
 }
 
 /**
- * The deterministic fingerprint of the production change under review.
- *
- * Covers tracked modifications AND untracked files, because a new source file
- * is exactly the kind of change that must not slip past a human approval.
- *
- * Dex's own artifacts and state are excluded, so appending to the
- * implementation log after approval does not invalidate the code approval.
+ * The feature's own Dex documents, as a git pathspec. These are the only files
+ * left out of the code approval: they are written after approval (the
+ * implementation log, the review, the PR description) and are copied into the
+ * PR by /dex:pr. Anything else under the artifact root is ordinary code.
  */
-export function diffFingerprint(cwd, base, config) {
-  if (!isGitRepo(cwd)) {
-    return { hash: null, base, reason: 'not a git repository' }
-  }
-  const excludes = [
-    `:(exclude,glob)${config.artifactRoot}/**`,
-    `:(exclude,glob)${config.stateRoot}/**`,
-  ]
-  const baseRef = base && git(['rev-parse', '--verify', '--quiet', base], { cwd, allowFail: true }) ? base : null
-  const args = ['--no-pager', 'diff', '--no-color', '--no-ext-diff', '--find-renames']
-  if (baseRef) args.push(baseRef)
-  args.push('--', '.', ...excludes)
-  const tracked = git(args, { cwd, allowFail: true }) ?? ''
+export function artifactPathspec(config, slug) {
+  return `:(glob)${config.artifactRoot}/${slug}/0[1-9]-*.md`
+}
 
-  // Untracked files, with content hashes, so adding a file changes the fingerprint.
-  const listed =
-    git(['--no-pager', 'ls-files', '--others', '--exclude-standard', '--', '.'], { cwd, allowFail: true }) ?? ''
-  const untracked = listed
-    .split('\n')
-    .map((l) => l.trim())
-    .filter(Boolean)
-    .filter((rel) => !isUnder(rel, config.artifactRoot) && !isUnder(rel, config.stateRoot))
-    .sort()
-    .map((rel) => {
-      let h = 'unreadable'
-      try {
-        h = sha256Buffer(fs.readFileSync(path.join(cwd, rel)))
-      } catch {
-        /* keep the marker */
-      }
-      return `${rel}\t${h}`
-    })
+function trace(what, dir) {
+  if (process.env.DEX_TRACE) process.stderr.write(`dex trace: ${what} ${dir}\n`)
+}
 
-  const material = `base=${baseRef ?? '(none)'}\n--tracked--\n${tracked}\n--untracked--\n${untracked.join('\n')}\n`
-  return {
-    hash: sha256String(material),
-    base: baseRef,
-    trackedBytes: tracked.length,
-    untrackedCount: untracked.length,
+/**
+ * Build a tree in a throwaway index so the real index is never touched.
+ * `fill` puts the right content into the index; the feature's own documents are
+ * then removed and the tree is written. Returns the tree SHA, or null.
+ */
+function treeFromIndex(dir, config, slug, fill) {
+  const indexPath = path.join(os.tmpdir(), `dex-index-${process.pid}-${crypto.randomBytes(6).toString('hex')}`)
+  const env = { ...process.env, GIT_INDEX_FILE: indexPath }
+  try {
+    fill(env)
+    git(['rm', '--cached', '-r', '-q', '--ignore-unmatch', '--', artifactPathspec(config, slug)], { cwd: dir, env })
+    return git(['write-tree'], { cwd: dir, env }).trim() || null
+  } finally {
+    try {
+      fs.rmSync(indexPath, { force: true })
+    } catch {
+      /* best effort */
+    }
   }
+}
+
+/**
+ * The tree the code approval covers: everything in the checkout at `dir` that
+ * git would commit with `git add -A` (tracked files, plus untracked files that
+ * are not ignored), minus the feature's own documents.
+ *
+ * Staging and committing do not change it. Any edit, new file, deletion or
+ * rename does. Returns null outside a git repository.
+ */
+export function workTree(dir, config, slug) {
+  if (!isGitRepo(dir)) return null
+  trace('workTree', dir)
+  return treeFromIndex(dir, config, slug, (env) => {
+    // Start from a copy of the real index so git can reuse its file stat cache.
+    const realIndex = git(['rev-parse', '--path-format=absolute', '--git-path', 'index'], { cwd: dir, allowFail: true })?.trim()
+    if (realIndex && fs.existsSync(realIndex)) fs.copyFileSync(realIndex, env.GIT_INDEX_FILE)
+    else git(['read-tree', 'HEAD'], { cwd: dir, env, allowFail: true })
+    git(['add', '-A', '--', '.'], { cwd: dir, env })
+  })
+}
+
+/** The tree of HEAD, minus the feature's own documents: what a push would publish. */
+export function headTree(dir, config, slug) {
+  if (!isGitRepo(dir)) return null
+  trace('headTree', dir)
+  return treeFromIndex(dir, config, slug, (env) => git(['read-tree', 'HEAD'], { cwd: dir, env }))
+}
+
+/** The tree of a commit, or null. */
+export function commitTree(dir, rev) {
+  return git(['rev-parse', '--verify', '--quiet', `${rev}^{tree}`], { cwd: dir, allowFail: true })?.trim() || null
+}
+
+/** The commit where the feature branched from `baseRef`, or null. */
+export function mergeBase(dir, baseRef) {
+  if (!baseRef) return null
+  return git(['merge-base', baseRef, 'HEAD'], { cwd: dir, allowFail: true })?.trim() || null
 }
 
 // ---------------------------------------------------------------------------

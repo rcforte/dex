@@ -532,4 +532,4 @@ Do this after step 8, before calling the work done.
 
 - ~~**Step 0 may rule out the approval hook.**~~ Resolved on 2026-09-28: the hook receives the raw typed text. See `dex/NOTES.md`.
 - **Pattern matching will still miss some interpreter tricks,** such as `python -c` writing files. The `pre-push` hook covers publishing to git. Direct file writes by interpreters before implementation starts remain a known gap. The README must say so.
-- **Step 3 changes what an approval is.** Approvals recorded before the upgrade will show as STALE. Bump `schemaVersion` to 2 and have `state.mjs` explain this, rather than refusing to load old state.
+- **Step 3 changes what an approval is.** Done without a format bump: a code approval recorded by the old code has no tree, so it shows as STALE with a note to read the diff and approve again.

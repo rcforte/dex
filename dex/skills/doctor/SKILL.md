@@ -15,7 +15,7 @@ Print the output verbatim. It exits non-zero when something is broken.
 If a check fails, fix the specific thing it names. Common cases:
 
 - **Node below 18** — the scripts use modern built-ins; upgrade Node.
-- **Not a git repository** — the human code approval gate binds to a diff hash and
+- **Not a git repository** — the human code approval gate binds to a git tree and
   cannot function without git. Dex will still run the earlier stages.
 - **State or artifact root not writable** — check directory permissions.
 - **Hooks missing** — nothing is enforcing the gates. The plugin is incomplete;
