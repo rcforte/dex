@@ -19,17 +19,27 @@ export const meta = {
  * build starts reporting where the feature should go instead of how the system
  * works today, and that opinion then travels downstream disguised as a finding.
  *
- * Worker constraints are inlined in the prompts rather than delegated via
- * agentType, so this script does not depend on how the plugin's agent registry
- * namespaces `research-probe`. The agent definitions in agents/ are the same
- * contract, used by the direct-delegation fallback path in skills/research.
+ * Probes and verifiers run as the plugin's own read-only agents (agents/
+ * research-probe.md and research-verifier.md: Read, Grep, Glob only), so the
+ * isolation does not rest on the prompt alone. The prompts repeat the rules.
+ *
+ * Paths come in through args. Workflow agents' shells do not have the plugin
+ * root variable, so the /dex:research skill resolves the plugin paths and
+ * passes them here.
  */
 
 const input = args || {}
 const slug = input.slug || 'unknown-feature'
-const questionsPath = input.questionsPath || `docs/dex/${slug}/02-questions.md`
-const researchPath = input.researchPath || `docs/dex/${slug}/03-research.md`
+const artifactRoot = input.artifactRoot || 'docs/dex'
+const stateRoot = input.stateRoot || '.dex'
+const stateScript = input.stateScript || 'state.mjs'
+const templatesDir = input.templatesDir || null
+const questionsPath = input.questionsPath || `${artifactRoot}/${slug}/02-questions.md`
+const researchPath = input.researchPath || `${artifactRoot}/${slug}/03-research.md`
+// How many research agents run at once. Every question is researched.
 const maxWorkers = Number(input.maxWorkers) > 0 ? Math.min(Number(input.maxWorkers), 24) : 6
+const probeAgent = input.probeAgentType || 'dex:research-probe'
+const verifierAgent = input.verifierAgentType || 'dex:research-verifier'
 
 const QUESTIONS_SCHEMA = {
   type: 'object',
@@ -49,7 +59,17 @@ const QUESTIONS_SCHEMA = {
         },
       },
     },
-    humanNotes: { type: 'string', description: 'Anything under "Human Notes" that changes scope' },
+    humanQuestions: {
+      type: 'array',
+      description: 'Questions the human added under "Human Notes", verbatim',
+      items: {
+        type: 'object',
+        required: ['question'],
+        additionalProperties: false,
+        properties: { question: { type: 'string' } },
+      },
+    },
+    humanNotes: { type: 'string', description: 'Anything else under "Human Notes" that changes scope' },
   },
 }
 
@@ -143,6 +163,10 @@ const PROBE_RULES = [
   'Do not say a pattern should be used; say where it exists and where it does not.',
   'Do not modify any file.',
   '',
+  `Do not read anything under ${artifactRoot}/** or ${stateRoot}/**. Those folders hold`,
+  'planning documents about work that has not been built. They are not the system, and',
+  'reading them would tell you what someone wants to build.',
+  '',
   'If you did not open the file, it is not a fact. If the repository contains nothing',
   'relevant, return empty facts and an unknown explaining what you searched. An honest',
   'empty result is a successful outcome; a plausible invention is not.',
@@ -174,7 +198,7 @@ const gate = await agent(
   [
     `Run exactly this command and report what it says about the questions gate:`,
     '',
-    `  node "$CLAUDE_PLUGIN_ROOT/scripts/state.mjs" check ${slug}`,
+    `  node "${stateScript}" check ${slug}`,
     '',
     'It prints JSON. Return gates.questions.status verbatim — one of APPROVED,',
     'DRAFT, STALE, or MISSING — and whether the feature exists.',
@@ -217,8 +241,8 @@ const parsed = await agent(
     'Skip headings that have no questions under them. Skip the "Explicitly excluded',
     'from research" section entirely.',
     '',
-    'If the "Human Notes" section contains instructions that change scope, return them',
-    'in humanNotes verbatim.',
+    'If the human added questions under "Human Notes", return each one in humanQuestions,',
+    'verbatim. Return any other scope instruction from Human Notes in humanNotes.',
     '',
     'Do not invent questions. Do not rewrite them. Return exactly what the file says.',
   ].join('\n'),
@@ -235,15 +259,30 @@ if (!parsed || !parsed.questions || parsed.questions.length === 0) {
   }
 }
 
-const questions = parsed.questions.slice(0, maxWorkers)
-if (parsed.questions.length > maxWorkers) {
-  log(
-    `${parsed.questions.length} questions found; researching the first ${maxWorkers} ` +
-      `(maxResearchWorkers=${maxWorkers}). Not researched: ` +
-      parsed.questions.slice(maxWorkers).map((q) => q.id).join(', ')
-  )
+// Every approved question is researched, including the ones the human added.
+const humanQuestions = (parsed.humanQuestions || []).map((h, i) => ({
+  id: `H${i + 1}`,
+  question: h.question,
+  category: 'Human Notes',
+}))
+const questions = [...parsed.questions, ...humanQuestions]
+log(`Researching ${questions.length} question(s) in isolated contexts, at most ${maxWorkers} agents at a time.`)
+
+// maxResearchWorkers limits how many agents run at once, not how many questions
+// are researched. A small queue enforces it across the probe and verify stages.
+let running = 0
+const waiting = []
+async function withSlot(start) {
+  if (running >= maxWorkers) await new Promise((resolve) => waiting.push(resolve))
+  running++
+  try {
+    return await start()
+  } finally {
+    running--
+    const next = waiting.shift()
+    if (next) next()
+  }
 }
-log(`Researching ${questions.length} question(s) in isolated contexts.`)
 
 // --- Phases 2 and 3: probe, then verify, per question -----------------------
 //
@@ -254,7 +293,7 @@ log(`Researching ${questions.length} question(s) in isolated contexts.`)
 const researched = await pipeline(
   questions,
   (question) =>
-    agent(
+    withSlot(() => agent(
       [
         'Investigate this question in the current repository:',
         '',
@@ -266,8 +305,9 @@ const researched = await pipeline(
         label: `probe:${question.id}`,
         phase: 'Research',
         schema: FINDINGS_SCHEMA,
+        agentType: probeAgent,
       }
-    ),
+    )),
   (findings, question) => {
     if (!findings) return null
     const claims = [...(findings.facts || []), ...(findings.inferences || [])]
@@ -276,7 +316,7 @@ const researched = await pipeline(
       // here would burn a context to confirm an empty result.
       return { question, findings, verification: null, skippedVerification: 'no claims to verify' }
     }
-    return agent(
+    return withSlot(() => agent(
       [
         'Check whether the cited repository evidence actually supports these findings.',
         '',
@@ -308,8 +348,9 @@ const researched = await pipeline(
         label: `verify:${question.id}`,
         phase: 'Verify',
         schema: VERDICT_SCHEMA,
+        agentType: verifierAgent,
       }
-    ).then((verification) => ({ question, findings, verification, skippedVerification: null }))
+    )).then((verification) => ({ question, findings, verification, skippedVerification: null }))
   }
 )
 
@@ -366,8 +407,10 @@ const report = await agent(
   [
     `Write the codebase research report to ${researchPath}.`,
     '',
-    `Use the template at \${CLAUDE_PLUGIN_ROOT}/templates/research.md for structure, or if`,
-    `that path is unavailable, the section order: Scope, Executive Map, Current System Flow,`,
+    templatesDir
+      ? `Use the template at ${templatesDir}/research.md for structure, or if`
+      : `Use`,
+    `${templatesDir ? 'that path is unavailable, ' : ''}the section order: Scope, Executive Map, Current System Flow,`,
     `Findings, Existing Patterns, Relevant Tests, Relevant Configuration, Relevant`,
     `Dependencies, Contradictions / Ambiguities, Research Confidence, Files Most Relevant`,
     `to Design.`,

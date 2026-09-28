@@ -3,7 +3,7 @@ name: verify
 description: Run the project's real verification commands for a Dex feature and persist the results as evidence. Invoke with /dex:verify <feature-slug>.
 disable-model-invocation: true
 argument-hint: <feature-slug>
-allowed-tools: Bash, Read, Glob, Grep, Task
+allowed-tools: Bash, Read, Glob, Grep, Agent
 ---
 
 # /dex:verify

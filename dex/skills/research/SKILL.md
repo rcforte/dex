@@ -3,7 +3,7 @@ name: research
 description: Run isolated objective codebase research for an approved set of Dex questions, producing 03-research.md. Invoke with /dex:research <feature-slug>.
 disable-model-invocation: true
 argument-hint: <feature-slug>
-allowed-tools: Bash, Read, Write, Glob, Grep, Task, Workflow
+allowed-tools: Bash, Read, Write, Glob, Grep, Agent, Workflow
 ---
 
 # /dex:research
@@ -28,15 +28,32 @@ this stage is built around.
 The orchestration lives in a workflow script, not in this prompt:
 
 ```text
-Workflow tool, script: ${CLAUDE_PLUGIN_ROOT}/workflows/research.js
-args: { "slug": "<slug>", "questionsPath": "docs/dex/<slug>/02-questions.md", "maxWorkers": <config.maxResearchWorkers> }
+Workflow tool, scriptPath: ${CLAUDE_PLUGIN_ROOT}/workflows/research.js
+args: {
+  "slug": "<slug>",
+  "maxWorkers": <config.maxResearchWorkers>,
+  "stateScript": "${CLAUDE_PLUGIN_ROOT}/scripts/state.mjs",
+  "templatesDir": "${CLAUDE_PLUGIN_ROOT}/templates",
+  "artifactRoot": "<config.artifactRoot>",
+  "stateRoot": "<config.stateRoot>"
+}
 ```
 
-Pass `args` as a real JSON object, not a string.
+Pass `args` as a real JSON object, not a string. The paths must be passed in:
+the workflow's agents cannot see the plugin folder on their own.
 
-The workflow parses the questions, fans out one isolated probe per question,
-verifies findings adversarially, and synthesizes a report. It runs in the
+The workflow parses the questions, including any the human added under Human
+Notes, fans out one isolated probe per question (at most `maxWorkers` at a time),
+verifies findings adversarially, and writes `03-research.md`. It runs in the
 background; its result arrives as a notification.
+
+**When the result arrives:**
+
+- If `ok` is `false`, stop. Tell the user the `reason` and what it says to do.
+  Do not research another way and do not write the report yourself.
+- If `ok` is `true`, the workflow has already written `03-research.md`. Do not
+  write it again. Read it, check it against the requirements in step 3, and tell
+  the user which questions came back unanswered (`unanswered` in the result).
 
 **The critical property: no worker receives `01-intent.md` or the feature
 description.** Workers get one question each. Do not add the intent to their
@@ -58,9 +75,10 @@ Fall back to direct subagent delegation, preserving the isolation:
 
 Never send the feature intent to a probe in either path.
 
-## 3. Write the report
+## 3. The report
 
-Write `03-research.md` from `${CLAUDE_PLUGIN_ROOT}/templates/research.md`.
+On the workflow path the report is already written; check it. On the fallback
+path, write `03-research.md` from `${CLAUDE_PLUGIN_ROOT}/templates/research.md`.
 
 Requirements:
 

@@ -23,8 +23,13 @@ export const meta = {
 
 const input = args || {}
 const slug = input.slug || 'unknown-feature'
+// The approved diff is <base>..<tree>: the pinned base commit and the tree the
+// code approval covers (`state.mjs diff-hash` prints both). A tree includes new
+// files, which a plain `git diff <base>` of the working copy would leave out.
 const base = input.base || ''
+const tree = input.tree || ''
 const worktree = input.worktree || '.'
+const stateScript = input.stateScript || 'state.mjs'
 const artifactRoot = input.artifactRoot || 'docs/dex'
 const stateRoot = input.stateRoot || '.dex'
 const reviewPath = input.reviewPath || `${artifactRoot}/${slug}/08-review.md`
@@ -141,11 +146,15 @@ const CONSOLIDATED_SCHEMA = {
   },
 }
 
-const diffCommands = [
-  `git -C ${worktree} --no-pager diff --stat ${base}`.trim(),
-  `git -C ${worktree} --no-pager diff ${base}`.trim(),
-  `git -C ${worktree} status --porcelain`,
-].join('\n  ')
+const diffCommands = (
+  tree
+    ? [`git -C ${worktree} --no-pager diff --stat ${base} ${tree}`, `git -C ${worktree} --no-pager diff ${base} ${tree}`]
+    : [
+        `git -C ${worktree} --no-pager diff --stat ${base}`.trim(),
+        `git -C ${worktree} --no-pager diff ${base}`.trim(),
+        `git -C ${worktree} ls-files --others --exclude-standard   (new files: read each one in full)`,
+      ]
+).join('\n  ')
 
 // --- Phase 1: scope ---------------------------------------------------------
 
@@ -361,7 +370,7 @@ await agent(
     'Scope section: what was reviewed, the base, which dimensions ran and which did not.',
     failedDimensions.length ? `Dimensions NOT covered: ${failedDimensions.join(', ')}` : 'All requested dimensions ran.',
     `Dimensions run: ${dimensions.join(', ')}`,
-    `Base: ${base || '(none recorded)'}`,
+    `Base: ${base || '(none recorded)'}${tree ? `, reviewed tree: ${tree}` : ''}`,
     '',
     verification ? `Verification evidence to tabulate: ${JSON.stringify(verification)}` : 'No verification evidence was supplied; say so.',
     '',
@@ -400,6 +409,6 @@ return {
   humanReviewStillRequired: true,
   recordCommand:
     conclusion === 'PASS'
-      ? `node "$CLAUDE_PLUGIN_ROOT/scripts/state.mjs" record-review ${slug} pass --blockers 0`
-      : `node "$CLAUDE_PLUGIN_ROOT/scripts/state.mjs" record-review ${slug} remediation-required --blockers ${blockers.length} --high ${highs.length}`,
+      ? `node "${stateScript}" record-review ${slug} pass --blockers 0`
+      : `node "${stateScript}" record-review ${slug} remediation-required --blockers ${blockers.length} --high ${highs.length}`,
 }

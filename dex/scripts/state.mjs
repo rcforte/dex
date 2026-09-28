@@ -651,7 +651,7 @@ COMMANDS.check = (ctx, argv) => {
     blocked: state.blocked,
     gates,
     next,
-    config: { artifactRoot: config.artifactRoot, reviewCadence: config.reviewCadence, requireWorktree: config.requireWorktree, requireAiReview: config.requireAiReview, requireHumanCodeApproval: config.requireHumanCodeApproval, strictGates: config.strictGates, maxResearchWorkers: config.maxResearchWorkers },
+    config: { artifactRoot: config.artifactRoot, stateRoot: config.stateRoot, reviewCadence: config.reviewCadence, requireWorktree: config.requireWorktree, requireAiReview: config.requireAiReview, requireHumanCodeApproval: config.requireHumanCodeApproval, strictGates: config.strictGates, maxResearchWorkers: config.maxResearchWorkers },
     artifacts: state.artifacts,
     worktree: state.worktree,
     warnings: config.__warnings || [],
@@ -933,11 +933,41 @@ COMMANDS['set-slices'] = (ctx, argv) => {
     refreshPhase(root, config, state)
     saveFeatureState(root, config, slug, state)
     appendEvent(root, config, slug, 'plan_generated', { checkpoints: slices.map((s) => s.id), tracer: slices.some((s) => s.tracer) })
+    const warnings = structureWarnings(root, state, slices)
     return {
-      text: `Recorded ${slices.length} implementation checkpoint(s):\n` + slices.map((s) => `  ${s.id}  ${s.name}${s.tracer ? '  [tracer]' : ''}`).join('\n'),
-      json: { slices },
+      text:
+        `Recorded ${slices.length} implementation checkpoint(s):\n` +
+        slices.map((s) => `  ${s.id}  ${s.name}${s.tracer ? '  [tracer]' : ''}`).join('\n') +
+        (warnings.length ? `\n\nWARNING:\n${warnings.map((w) => `  - ${w}`).join('\n')}` : ''),
+      json: { slices, warnings },
     }
   })
+}
+
+/**
+ * Compare recorded checkpoints with the approved structure document: its
+ * "Tracer bullet required:" line and the checkpoint ids it mentions.
+ */
+function structureWarnings(root, state, slices) {
+  let text = ''
+  try {
+    text = fs.readFileSync(artifactAbs(root, state, 'structure'), 'utf8')
+  } catch {
+    return []
+  }
+  const warnings = []
+  if (/Tracer bullet required:\s*\**\s*YES/i.test(text) && !slices.some((s) => s.tracer)) {
+    warnings.push('the structure says a tracer bullet is required, but no checkpoint is named as the tracer (put "tracer" in its name)')
+  }
+  const inStructure = [...new Set([...text.matchAll(/\bS0*([1-9]\d*)\b/g)].map((m) => `S${m[1]}`))]
+  if (inStructure.length) {
+    const recorded = slices.map((s) => s.id)
+    const missing = inStructure.filter((id) => !recorded.includes(id))
+    const extra = recorded.filter((id) => !inStructure.includes(id))
+    if (missing.length) warnings.push(`the structure names ${missing.join(', ')}, which are not recorded`)
+    if (extra.length) warnings.push(`${extra.join(', ')} ${extra.length === 1 ? 'is' : 'are'} recorded but not in the structure`)
+  }
+  return warnings
 }
 
 /** S1, s1 and S01 all name checkpoint S1. Returns null for anything else. */
@@ -1430,16 +1460,18 @@ COMMANDS.config = (ctx) => {
 }
 
 COMMANDS['diff-hash'] = (ctx, argv) => {
-  const { rest } = parseFlags(argv)
+  const { flags, rest } = parseFlags(argv)
   const { root, config } = ctx
   const slug = requireSlug(rest[0] || readActiveSlug(root, config), 'diff-hash')
   const state = loadFeatureState(root, config, slug)
   const dir = featureDir(root, state)
   const tree = workTree(dir, config, slug)
   const baseSha = state.worktree?.baseSha || null
+  const json = { dir, baseSha, tree }
+  if (flags.json) return { text: JSON.stringify(json), json }
   return {
     text: `dir:    ${dir}\nbase:   ${baseSha ?? '(not pinned)'}\ntree:   ${tree ?? '(none)'}` + (baseSha && tree ? `\n\nRead it:\n  git -C ${dir} diff ${baseSha} ${tree}` : ''),
-    json: { dir, baseSha, tree },
+    json,
   }
 }
 

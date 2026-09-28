@@ -3,7 +3,7 @@ name: implement
 description: Implement one approved checkpoint in the isolated worktree, verify it, and record the result in 07-implementation-log.md. Invoke with /dex:implement <feature-slug> [checkpoint].
 disable-model-invocation: true
 argument-hint: <feature-slug> [checkpoint-id]
-allowed-tools: Bash, Read, Write, Edit, Glob, Grep, Task
+allowed-tools: Bash, Read, Write, Edit, Glob, Grep, Agent
 ---
 
 # /dex:implement

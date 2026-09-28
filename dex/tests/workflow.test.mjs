@@ -199,11 +199,8 @@ test('review states that it does not replace human code review', () => {
   assert.match(src, /humanReviewStillRequired: true/)
 })
 
-test('research honors the maxResearchWorkers cap and says what it dropped', () => {
-  const src = workflowSource('research.js')
-  assert.match(src, /maxWorkers/)
-  assert.match(src, /Not researched:/, 'a cap must be reported, never silent')
-})
+// maxResearchWorkers now limits concurrency, and every question is researched:
+// see "finding 17" in workflows-run.test.mjs, which runs the workflow.
 
 // ---------------------------------------------------------------------------
 // Plugin structure
@@ -512,7 +509,7 @@ test('the research workflow re-checks the questions gate itself', () => {
   // The skill checks the gate before invoking the workflow, but the workflow is
   // directly invocable, so the gate has to hold here too.
   const src = workflowSource('research.js')
-  assert.match(src, /scripts\/state\.mjs" check/, 'the workflow must run the deterministic gate check')
+  assert.match(src, /\$\{stateScript\}" check/, 'the workflow must run the deterministic gate check')
   assert.match(src, /questionsGateStatus !== 'APPROVED'/, 'anything but APPROVED must stop research')
   assert.match(prose('workflows', 'research.js'), /Fail closed: an unreadable gate is treated as an unapproved gate/)
   // The refusal has to name the recovery command, not just decline.

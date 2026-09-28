@@ -3,7 +3,7 @@ name: review
 description: Run independent multi-angle AI review of a Dex feature's production diff, producing 08-review.md. Invoke with /dex:review <feature-slug>.
 disable-model-invocation: true
 argument-hint: <feature-slug>
-allowed-tools: Bash, Read, Write, Glob, Grep, Task, Workflow
+allowed-tools: Bash, Read, Write, Glob, Grep, Agent, Workflow
 ---
 
 # /dex:review
@@ -29,9 +29,10 @@ change anyway.
 Pick the ones the change actually touches. Running every category on every change
 produces noise, and noise gets skimmed.
 
-Available: correctness, design and structure conformance, regressions, security,
-error handling, concurrency and transactions, test adequacy, architecture boundary
-violations, backward compatibility.
+Available dimensions: `correctness`, `design-conformance`, `regressions`, `security`, `error-handling`, `concurrency-transactions`, `test-adequacy`, `architecture-boundaries`, `backward-compatibility`.
+
+Pass these exact names. The workflow has a brief for each one; any other name gets
+a generic brief.
 
 Choose from the diff: schema changes pull in backward compatibility; a new
 endpoint pulls in security; anything touching `@Transactional` or locks pulls in
@@ -39,12 +40,38 @@ concurrency. Typically three to five dimensions.
 
 ## 3. Run the review workflow
 
+Get the exact diff the human will approve:
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/state.mjs" diff-hash <slug> --json
+```
+
+It prints `dir`, `baseSha` and `tree`. Then:
+
 ```text
-Workflow tool, script: ${CLAUDE_PLUGIN_ROOT}/workflows/review.js
-args: { "slug": "<slug>", "dimensions": ["correctness","security","test-adequacy"], "base": "<base-branch>", "worktree": "<path>" }
+Workflow tool, scriptPath: ${CLAUDE_PLUGIN_ROOT}/workflows/review.js
+args: {
+  "slug": "<slug>",
+  "dimensions": ["correctness", "design-conformance", "test-adequacy"],
+  "worktree": "<dir>",
+  "base": "<baseSha>",
+  "tree": "<tree>",
+  "verification": <gates.verification from the check output>,
+  "stateScript": "${CLAUDE_PLUGIN_ROOT}/scripts/state.mjs",
+  "templatesDir": "${CLAUDE_PLUGIN_ROOT}/templates",
+  "artifactRoot": "<config.artifactRoot>",
+  "stateRoot": "<config.stateRoot>"
+}
 ```
 
 Pass `args` as a real JSON object.
+
+**When the result arrives:**
+
+- If `ok` is `false`, stop and tell the user the `reason`. Do not review another
+  way and do not write the report yourself.
+- If `ok` is `true`, the workflow has already written `08-review.md`. Do not write
+  it again. Record the result with the `recordCommand` it returns (step 5).
 
 The workflow reviews each dimension in an isolated context, then runs a
 consolidation pass that deduplicates findings, checks each one's evidence, drops
@@ -59,9 +86,10 @@ what was intended — that is how it checks conformance.
 Launch one `implementation-reviewer` subagent per dimension in a single message,
 then consolidate the findings yourself.
 
-## 4. Write the report
+## 4. The report
 
-Use `${CLAUDE_PLUGIN_ROOT}/templates/review.md`.
+On the workflow path the report is already written. On the fallback path, write
+it from `${CLAUDE_PLUGIN_ROOT}/templates/review.md`.
 
 Every finding carries: severity, file, line or symbol, claim, evidence, impact,
 recommended correction, confidence.

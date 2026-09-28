@@ -39,14 +39,21 @@ Include: summary, links to intent, design and structure, the checkpoint list, th
 verification table with real exit codes, the AI review conclusion, the human code
 approved tree and base commit from state, risk, and rollback.
 
-The hash matters. It records exactly which diff a human read and approved.
+The tree and base commit matter. Together they name exactly the diff a human read
+and approved: `git diff <baseSha> <tree>`.
 
 ## 3. Commit and push
 
 Confirm with the user before pushing — this is the outward-facing, hard-to-reverse
 step, and approval of the code is not by itself approval to publish it.
 
+First copy the feature's documents into the worktree, so reviewers of the PR can
+read the intent, design and plan next to the code. Dex leaves these files out of
+the code approval, so copying them in does not make it stale.
+
 ```bash
+mkdir -p <worktree>/<artifactRoot>
+cp -R <artifactRoot>/<slug> <worktree>/<artifactRoot>/
 git -C <worktree> status --porcelain
 git -C <worktree> add -A
 git -C <worktree> commit -m "<message>"
@@ -60,7 +67,7 @@ Use the repository's existing commit message convention — check `git log`.
 If `gh` is available:
 
 ```bash
-gh pr create --base <base> --head <branch> --title "<title>" --body-file docs/dex/<slug>/09-pr.md
+gh pr create --base <base> --head <branch> --title "<title>" --body-file <artifactRoot>/<slug>/09-pr.md
 ```
 
 Otherwise print the body and the exact command for the user to run, including the

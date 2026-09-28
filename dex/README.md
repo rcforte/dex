@@ -401,8 +401,11 @@ Four agents, each for context isolation rather than role-play:
 | `implementation-reviewer` | Find material defects along one dimension | Read, Grep, Glob, Bash (read-only) |
 | `verification-analyzer` | Separate a root-cause failure from its cascade | Read, Grep, Glob, Bash (read-only) |
 
-No `chief-architect`. No `qa-manager`. The research agents have no write tools at
-all.
+No `chief-architect`. No `qa-manager`. The research probes and verifiers have no
+write tools: the research workflow runs them as these two agents. They are also
+told not to read `docs/dex/**` or `.dex/**`; that part is an instruction, since a
+read-only agent can still read any file. The agent that writes `03-research.md`
+is an ordinary workflow agent.
 
 ## Workflows
 
