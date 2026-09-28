@@ -266,7 +266,7 @@ test('a stale design approval re-locks production code edits', async () => {
 
 test('recorded design drift re-locks production code edits', async () => {
   const ctx = await ctxAt('worktree')
-  await state(ctx.root, ['drift', 'feat', '--reason', 'events are emitted elsewhere', '--slice', 'S1'])
+  await state(ctx.root, ['drift', 'feat', '--target', 'design', '--reason', 'events are emitted elsewhere', '--slice', 'S1'])
   ctx.refresh()
 
   const r = verdict(ctx, edit('src/PortfolioService.java'))

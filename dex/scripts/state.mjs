@@ -116,7 +116,12 @@ function artifactExists(root, state, key) {
 function approvalStatus(root, state, gateKey, artifactKey) {
   const approval = state.approvals[gateKey]
   const exists = artifactExists(root, state, artifactKey)
-  if (!exists) return { status: GATE.MISSING, stale: false, approved: false, reason: 'artifact does not exist' }
+  if (!exists) {
+    if (approval?.approved) {
+      return { status: GATE.STALE, stale: true, approved: false, reason: `${state.artifacts[artifactKey]} was emptied or deleted after it was approved` }
+    }
+    return { status: GATE.MISSING, stale: false, approved: false, reason: 'artifact does not exist' }
+  }
   if (!approval || !approval.approved) {
     return { status: GATE.DRAFT, stale: false, approved: false, reason: 'awaiting human approval' }
   }
@@ -131,8 +136,24 @@ function approvalStatus(root, state, gateKey, artifactKey) {
       reason: `${artifactKey} changed after approval`,
     }
   }
+  // One level of dependency: the design rests on the approved questions, the
+  // structure on the approved design. Re-approving the earlier document with
+  // new content makes this approval stale.
+  const up = approval.upstream
+  if (up && typeof up.hash === 'string' && state.approvals[up.gate]?.artifactHash !== up.hash) {
+    return {
+      status: GATE.STALE,
+      stale: true,
+      approved: false,
+      reason: `${UPSTREAM_CHANGED[up.gate]} re-approved with new content after the ${gateKey} was approved; re-read the ${gateKey} and approve it again`,
+    }
+  }
   return { status: GATE.APPROVED, stale: false, approved: true, approvedAt: approval.approvedAt, artifactHash: current }
 }
+
+/** What each artifact approval rests on. */
+const UPSTREAM = { design: 'questions', structure: 'design' }
+const UPSTREAM_CHANGED = { questions: 'the questions were', design: 'the design was' }
 
 /** The checkout the feature's code lives in: its worktree, or the main checkout. */
 export function featureDir(root, state) {
@@ -265,6 +286,7 @@ export function computeGates(root, config, state, { trees = true } = {}) {
   // only thing that grants permission.
 
   const implBlockers = []
+  if (!g.questions.approved) implBlockers.push(`questions are ${g.questions.status} (${g.questions.reason ?? ''})`.trim())
   if (!g.design.approved) implBlockers.push(`design is ${g.design.status} (${g.design.reason ?? ''})`.trim())
   if (!g.structure.approved) implBlockers.push(`structure is ${g.structure.status} (${g.structure.reason ?? ''})`.trim())
   if (g.plan.status !== GATE.COMPLETE) implBlockers.push('tactical plan (06-plan.md) does not exist')
@@ -272,7 +294,9 @@ export function computeGates(root, config, state, { trees = true } = {}) {
   if (state.blocked) implBlockers.push(`feature is blocked: ${state.blocked.reason}`)
   g.canImplement = { allowed: implBlockers.length === 0, blockers: implBlockers }
 
-  const prBlockers = []
+  // Publishing needs everything implementation needs: an approval that went
+  // stale after the code was written still has to be looked at again.
+  const prBlockers = [...implBlockers]
   if (g.implementation.status !== GATE.COMPLETE) {
     prBlockers.push(
       g.implementation.total === 0
@@ -286,7 +310,6 @@ export function computeGates(root, config, state, { trees = true } = {}) {
     prBlockers.push(`${state.aiReview.blockers} unresolved BLOCKER finding(s) in the AI review`)
   }
   if (!g.humanCodeReview.approved) prBlockers.push(`human code review is ${g.humanCodeReview.status}`)
-  if (state.blocked) prBlockers.push(`feature is blocked: ${state.blocked.reason}`)
   g.canPr = { allowed: prBlockers.length === 0, blockers: prBlockers }
 
   // Publishing needs one more thing: HEAD must hold exactly the approved code,
@@ -320,10 +343,19 @@ export function nextAction(root, config, state, gates) {
   const g = gates
 
   if (state.blocked) {
+    const staleKey = ['questions', 'design', 'structure'].find((k) => g[k].stale)
+    if (staleKey) {
+      return {
+        action: `reapprove-${staleKey}`,
+        command: `/dex:approve ${staleKey} ${slug}`,
+        why: `Feature is blocked: ${state.blocked.reason}. Re-read the revised ${staleKey} and approve it; Dex unblocks the feature once every approval is current.`,
+      }
+    }
+    const target = state.blocked.target || 'design'
     return {
       action: 'resolve-drift',
-      command: `/dex:design ${slug}`,
-      why: `Feature is blocked: ${state.blocked.reason}. Revise the affected upstream artifact, then re-approve it.`,
+      command: `/dex:${target} ${slug}`,
+      why: `Feature is blocked: ${state.blocked.reason}. Revise the ${target}, then approve it again.`,
     }
   }
   for (const key of ['questions', 'design', 'structure']) {
@@ -521,6 +553,9 @@ export function renderStatus(root, config, state, gates) {
 // Commands
 // ---------------------------------------------------------------------------
 
+/** Flags that are switches. Every other flag must be followed by a value. */
+const BOOLEAN_FLAGS = new Set(['json', 'replace', 'review'])
+
 function parseFlags(argv) {
   const flags = {}
   const rest = []
@@ -529,8 +564,10 @@ function parseFlags(argv) {
     if (a.startsWith('--')) {
       const key = a.slice(2)
       const next = argv[i + 1]
-      if (next === undefined || next.startsWith('--')) {
+      if (BOOLEAN_FLAGS.has(key)) {
         flags[key] = true
+      } else if (next === undefined || next.startsWith('--')) {
+        throw new DexError(`--${key} needs a value.\n\nExample: --${key} "<value>"`)
       } else {
         flags[key] = next
         i++
@@ -737,7 +774,16 @@ COMMANDS.approve = (ctx, argv) => {
     }
     const hash = hashFile(abs)
     const previous = state.approvals[artifactKey]
-    state.approvals[artifactKey] = { approved: true, approvedAt: nowIso(), artifactHash: hash }
+    const upGate = UPSTREAM[artifactKey]
+    state.approvals[artifactKey] = {
+      approved: true,
+      approvedAt: nowIso(),
+      artifactHash: hash,
+      ...(upGate ? { upstream: { gate: upGate, hash: state.approvals[upGate]?.artifactHash ?? null } } : {}),
+    }
+    // A feature blocked by drift unblocks itself once the revised documents
+    // are approved again. Nothing else can unblock it.
+    const unblocked = state.blocked ? tryUnblock(root, config, state).unblocked : false
     const gates = refreshPhase(root, config, state)
     saveFeatureState(root, config, slug, state)
     appendEvent(root, config, slug, `${gate}_approved`, {
@@ -753,8 +799,9 @@ COMMANDS.approve = (ctx, argv) => {
         `Artifact: ${state.artifacts[artifactKey]}\n` +
         `SHA-256:  ${hash}\n\n` +
         `Editing that file after this point makes the approval stale.\n\n` +
+        (unblocked ? `The design drift is resolved: feature unblocked.\n\n` : state.blocked ? `The feature is still blocked: ${state.blocked.reason}\n\n` : '') +
         `Next: ${next.command ?? '(nothing)'}`,
-      json: { gate, artifactHash: hash, artifact: state.artifacts[artifactKey], next },
+      json: { gate, artifactHash: hash, artifact: state.artifacts[artifactKey], unblocked, next },
     }
   })
 }
@@ -844,14 +891,15 @@ COMMANDS['set-slices'] = (ctx, argv) => {
     const existing = new Map((state.slices || []).map((s) => [s.id, s]))
     const slices = specs.map((spec) => {
       const idx = spec.indexOf(':')
-      const id = (idx === -1 ? spec : spec.slice(0, idx)).trim()
+      const raw = (idx === -1 ? spec : spec.slice(0, idx)).trim()
       const name = idx === -1 ? '' : spec.slice(idx + 1).trim()
-      if (!/^S\d+$/i.test(id)) {
-        throw new DexError(`Checkpoint id "${id}" must look like S1, S2, S3.\n\nGot: ${spec}`)
+      const id = normalizeSliceId(raw)
+      if (!id) {
+        throw new DexError(`Checkpoint id "${raw}" must look like S1, S2, S3.\n\nGot: ${spec}`)
       }
-      const prior = existing.get(id.toUpperCase())
+      const prior = existing.get(id)
       return {
-        id: id.toUpperCase(),
+        id,
         name,
         tracer: /tracer/i.test(name),
         status: prior?.status ?? 'pending',
@@ -863,6 +911,23 @@ COMMANDS['set-slices'] = (ctx, argv) => {
     })
     const dupes = slices.map((s) => s.id).filter((id, i, a) => a.indexOf(id) !== i)
     if (dupes.length) throw new DexError(`Duplicate checkpoint ids: ${[...new Set(dupes)].join(', ')}`)
+    const oldIds = [...existing.keys()].sort()
+    const newIds = slices.map((s) => s.id).sort()
+    const started = [...existing.values()].filter((s) => s.status !== 'pending').map((s) => s.id)
+    if (started.length && oldIds.join() !== newIds.join()) {
+      throw new DexError(
+        `Dex will not change the checkpoints of "${slug}": ${started.join(', ')} already started.\n\n` +
+          `Recorded: ${oldIds.join(', ')}\nRequested: ${newIds.join(', ')}\n\n` +
+          `If the structure really changed, that is design drift:\n  node state.mjs drift ${slug} --target structure --reason "..."`
+      )
+    }
+    const dropped = oldIds.filter((id) => !newIds.includes(id))
+    if (dropped.length && !flags.replace) {
+      throw new DexError(
+        `This would drop recorded checkpoint(s) ${dropped.join(', ')}.\n\n` +
+          `If that is intended, repeat the command with --replace.`
+      )
+    }
     state.slices = slices
     refreshPhase(root, config, state)
     saveFeatureState(root, config, slug, state)
@@ -874,8 +939,14 @@ COMMANDS['set-slices'] = (ctx, argv) => {
   })
 }
 
+/** S1, s1 and S01 all name checkpoint S1. Returns null for anything else. */
+function normalizeSliceId(id) {
+  const m = /^S0*([1-9]\d*)$/i.exec(String(id || '').trim())
+  return m ? `S${m[1]}` : null
+}
+
 function findSlice(state, id) {
-  const wanted = String(id || '').toUpperCase()
+  const wanted = normalizeSliceId(id) || String(id || '').toUpperCase()
   const slice = (state.slices || []).find((s) => s.id === wanted)
   if (!slice) {
     throw new DexError(
@@ -943,6 +1014,19 @@ COMMANDS['finish-slice'] = (ctx, argv) => {
   return withFeatureLock(root, config, slug, () => {
     const state = loadFeatureState(root, config, slug)
     const slice = findSlice(state, rest[1])
+    if (state.blocked) {
+      throw new DexError(`Dex will not complete checkpoint ${slice.id}: feature "${slug}" is blocked (${state.blocked.reason}).\n\nNext:\n  /dex:status ${slug}`)
+    }
+    if (slice.status !== 'in-progress') {
+      throw new DexError(`Checkpoint ${slice.id} is ${slice.status}, not in progress. Start it first:\n  node state.mjs start-slice ${slug} ${slice.id}`)
+    }
+    const allowed = computeGates(root, config, state, { trees: false }).canImplement
+    if (!allowed.allowed) {
+      throw new DexError(
+        `Dex will not complete checkpoint ${slice.id} because implementation gates are not satisfied:\n\n` +
+          allowed.blockers.map((b) => `  - ${b}`).join('\n')
+      )
+    }
     if (!flags.verification) {
       throw new DexError(
         `Dex will not mark checkpoint ${slice.id} complete without its verification result.\n\n` +
@@ -1206,38 +1290,75 @@ COMMANDS['record-pr'] = (ctx, argv) => {
   })
 }
 
+const DRIFT_TARGETS = ['design', 'structure']
+
 COMMANDS.drift = (ctx, argv) => {
   const { flags, rest } = parseFlags(argv)
   const slug = requireSlug(rest[0], 'drift')
-  if (!flags.reason) {
-    throw new DexError(`Usage: node state.mjs drift <slug> --reason "what the repository shows that the design assumed otherwise" [--slice S2]`)
+  const usage = `Usage: node state.mjs drift <slug> --target design|structure --reason "what the repository shows that the design assumed otherwise" [--slice S2]`
+  if (!flags.reason) throw new DexError(usage)
+  if (!DRIFT_TARGETS.includes(flags.target)) {
+    throw new DexError(`--target must be design (the destination changed) or structure (only the route changed).\n\n${usage}`)
   }
   const { root, config } = ctx
   return withFeatureLock(root, config, slug, () => {
     const state = loadFeatureState(root, config, slug)
+    const slice = flags.slice === undefined ? null : findSlice(state, flags.slice)
     state.blocked = {
       reason: String(flags.reason).slice(0, 1000),
-      slice: typeof flags.slice === 'string' ? flags.slice.toUpperCase() : null,
+      target: flags.target,
+      slice: slice ? slice.id : null,
       since: nowIso(),
       kind: 'design-drift',
     }
-    if (state.blocked.slice) {
-      const slice = (state.slices || []).find((s) => s.id === state.blocked.slice)
-      if (slice) slice.status = 'blocked'
+    if (slice) {
+      slice.status = 'blocked'
+      slice.blockedBy = 'drift'
     }
+    refreshPhase(root, config, state)
     saveFeatureState(root, config, slug, state)
-    appendEvent(root, config, slug, 'design_drift_recorded', { slice: state.blocked.slice, reason: state.blocked.reason })
+    appendEvent(root, config, slug, 'design_drift_recorded', { target: flags.target, slice: state.blocked.slice, reason: state.blocked.reason })
     return {
       text:
         `DESIGN DRIFT recorded. Feature "${slug}" is blocked.\n\n` +
         `Reason: ${state.blocked.reason}\n\n` +
-        `Record the evidence in ${state.artifacts.implementationLog}, then revise the affected artifact:\n` +
-        `  /dex:design ${slug}      (if the destination changed)\n` +
-        `  /dex:structure ${slug}   (if only the route changed)\n\n` +
-        `Re-approve it, then:\n  node state.mjs unblock ${slug}`,
+        `Record the evidence in ${state.artifacts.implementationLog}, then revise the ${flags.target}:\n` +
+        `  /dex:${flags.target} ${slug}\n\n` +
+        `When the user approves the revised documents again, Dex unblocks the feature by itself.`,
       json: { blocked: state.blocked },
     }
   })
+}
+
+/**
+ * Clear a drift block, but only once the revision has been approved: the
+ * drift's target has an approval newer than the drift, and every document
+ * approval is current. Resets only the checkpoint the drift blocked.
+ * Mutates `state`; returns { unblocked, reasons }.
+ */
+function tryUnblock(root, config, state) {
+  const was = state.blocked
+  if (!was) return { unblocked: false, reasons: ['the feature is not blocked'] }
+  const gates = computeGates(root, config, state, { trees: false })
+  const reasons = []
+  for (const k of ['questions', 'design', 'structure']) {
+    if (!gates[k].approved) reasons.push(`${k} is ${gates[k].status}: /dex:approve ${k} ${state.feature.slug}`)
+  }
+  const target = was.target || 'design'
+  const approvedAt = state.approvals[target]?.approvedAt
+  if (!approvedAt || approvedAt <= was.since) {
+    reasons.push(`the ${target} has not been approved since the drift: revise it, then /dex:approve ${target} ${state.feature.slug}`)
+  }
+  if (reasons.length) return { unblocked: false, reasons }
+  state.blocked = null
+  for (const s of state.slices || []) {
+    if (s.status === 'blocked' && s.blockedBy === 'drift') {
+      s.status = s.startedAt ? 'in-progress' : 'pending'
+      delete s.blockedBy
+    }
+  }
+  appendEvent(root, config, state.feature.slug, 'drift_resolved', { previousReason: was.reason, target })
+  return { unblocked: true, reasons: [] }
 }
 
 COMMANDS.unblock = (ctx, argv) => {
@@ -1247,21 +1368,15 @@ COMMANDS.unblock = (ctx, argv) => {
   return withFeatureLock(root, config, slug, () => {
     const state = loadFeatureState(root, config, slug)
     if (!state.blocked) return { text: `Feature "${slug}" is not blocked.`, json: { blocked: null } }
-    const gates = computeGates(root, config, state)
-    const stale = gates.staleApprovals.filter((k) => k !== 'humanCodeReview')
-    if (stale.length) {
+    const { unblocked, reasons } = tryUnblock(root, config, state)
+    if (!unblocked) {
       throw new DexError(
-        `Dex will not unblock "${slug}" while these approvals are stale: ${stale.join(', ')}.\n\n` +
-          `The drift was resolved by changing an artifact, so that artifact needs a fresh human approval.\n\n` +
-          stale.map((k) => `  /dex:approve ${k} ${slug}`).join('\n')
+        `Dex will not unblock "${slug}" yet. The drift is resolved by a revision the user has approved:\n\n` +
+          reasons.map((r) => `  - ${r}`).join('\n')
       )
     }
-    const was = state.blocked
-    state.blocked = null
-    for (const s of state.slices || []) if (s.status === 'blocked') s.status = 'pending'
     const after = refreshPhase(root, config, state)
     saveFeatureState(root, config, slug, state)
-    appendEvent(root, config, slug, 'drift_resolved', { previousReason: was.reason })
     return { text: `Feature "${slug}" unblocked.\nPhase: ${state.phase}\n\nNext: ${nextAction(root, config, state, after).command ?? '(nothing)'}`, json: { phase: state.phase } }
   })
 }

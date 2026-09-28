@@ -262,17 +262,18 @@ test('checkpoint ids must be well formed and unique', async () => {
   assert.match(await stateFails(root, ['set-slices', 'feat', 'S1:a', 'S1:b']), /Duplicate checkpoint ids: S1/)
 })
 
-test('re-recording checkpoints preserves completed progress', async () => {
+test('re-recording the same checkpoints preserves completed progress', async () => {
   const root = makeRepo()
   await advanceTo(root, 'feat', 'worktree')
   await state(root, ['start-slice', 'feat', 'S1'])
   await state(root, ['finish-slice', 'feat', 'S1', '--verification', 'mvn test'])
 
-  await state(root, ['set-slices', 'feat', 'S1:tracer — end to end', 'S2:happy path', 'S3:validation'])
+  await state(root, ['set-slices', 'feat', 'S1:tracer — end to end, renamed', 'S2:happy path'])
   const slices = readState(root, 'feat').slices
-  assert.equal(slices.length, 3)
+  assert.equal(slices.length, 2)
   assert.equal(slices[0].status, 'complete')
-  assert.equal(slices[2].status, 'pending')
+  assert.equal(slices[0].name, 'tracer — end to end, renamed')
+  assert.equal(slices[1].status, 'pending')
 })
 
 // ---------------------------------------------------------------------------
@@ -515,7 +516,7 @@ test('recorded design drift blocks the feature until the artifact is re-approved
   const root = makeRepo()
   await advanceTo(root, 'feat', 'worktree')
 
-  await state(root, ['drift', 'feat', '--reason', 'events are emitted by the unit of work, not the repository', '--slice', 'S2'])
+  await state(root, ['drift', 'feat', '--target', 'design', '--reason', 'events are emitted by the unit of work, not the repository', '--slice', 'S2'])
   let check = await state(root, ['check', 'feat'])
   assert.ok(check.json.blocked)
   assert.equal(check.json.gates.canImplement.allowed, false)
@@ -526,10 +527,14 @@ test('recorded design drift blocks the feature until the artifact is re-approved
   // Revising the design makes its approval stale, so unblocking is refused until
   // a human approves the revision.
   write(root, 'docs/dex/feat/04-design.md', '# Design\n\nRevised: the unit of work owns event publication.\n')
-  assert.match(await stateFails(root, ['unblock', 'feat']), /will not unblock "feat" while these approvals are stale: design/)
+  assert.match(await stateFails(root, ['unblock', 'feat']), /will not unblock "feat" yet[\s\S]*design is STALE/)
 
+  // Re-approving the design unblocks the feature once the structure built on it
+  // has been re-approved as well.
   await state(root, ['approve', 'feat', 'design'])
-  await state(root, ['unblock', 'feat'])
+  assert.ok((await state(root, ['check', 'feat'])).json.blocked)
+  const last = await state(root, ['approve', 'feat', 'structure'])
+  assert.equal(last.json.unblocked, true)
 
   check = await state(root, ['check', 'feat'])
   assert.equal(check.json.blocked, null)

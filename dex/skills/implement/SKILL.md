@@ -92,14 +92,18 @@ Never make a test pass by deleting or skipping it.
 Do not make it work anyway.
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/state.mjs" drift <slug> --reason "<what the code shows vs what the design assumed>" --slice <id>
+node "${CLAUDE_PLUGIN_ROOT}/scripts/state.mjs" drift <slug> --target <design|structure> --reason "<what the code shows vs what the design assumed>" --slice <id>
 ```
+
+`--target design` when the destination changed; `--target structure` when only
+the route changed.
 
 Record the full picture in the `DESIGN DRIFT` section of
 `07-implementation-log.md`: the checkpoint, the discovery, the evidence with file
 and line numbers, the impact, and whether design or structure needs revising.
 
-This blocks the feature until the affected artifact is revised and re-approved.
+This blocks the feature until the affected artifact is revised and the user
+approves it again with `/dex:approve`. Dex then unblocks the feature by itself.
 That is correct. Silently improvising a materially different architecture is how a
 feature ends up as something nobody approved.
 
