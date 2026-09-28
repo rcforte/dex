@@ -117,6 +117,7 @@ test('finding 1: the guard refuses the model running state.mjs approve', async (
     `node   "${STATE_CLI}"   approve code feat`,
     `cd /tmp && node ${STATE_CLI} approve code feat`,
     `sh -c "node ${STATE_CLI} approve code feat"`,
+    `python3 -c "import subprocess; subprocess.run(['node', '${STATE_CLI}', 'approve', 'code', 'feat'])"`,
   ]) {
     const r = guardBash(root, command)
     assert.equal(r.decision, 'deny', command)

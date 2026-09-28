@@ -360,13 +360,14 @@ Drift now takes `--target design|structure` instead of guessing from the reason 
    - Resolve symlinks on the deepest folder that exists.
    - Deny anything that still escapes the repo.
    - Apply the `/tmp` and `$TMPDIR` exemption only to paths that end up outside the repo.
+   - As built: a write that lands outside every checkout Dex knows about (the main checkout and each feature worktree) is allowed. Dex guards the repository, not the rest of the disk.
 6. **The matcher.**
    - Widen `hooks.json` to `Write|Edit|MultiEdit|NotebookEdit|Bash|ApplyPatch|PowerShell|Shell|mcp__.*`.
    - For `ApplyPatch`, read the targets from `*** (Add|Update|Delete) File:` lines.
    - For MCP tools, check the common path fields: `path`, `file_path`, `filePath`, `target`.
 7. **The "main script" check.** In `guard.mjs` and `state.mjs`, compare `import.meta.url` with `pathToFileURL(realpathSync(process.argv[1])).href`.
 8. **The `pre-push` hook (Q12).**
-   - New `scripts/pre-push.mjs`, installed by a new command, `state.mjs install-hook <slug>`. `/dex:worktree` calls it.
+   - New `scripts/pre-push.mjs`, installed by a new command, `state.mjs install-hook`. `/dex:worktree` calls it. (It takes no slug: one hook covers every `dex/*` branch.)
    - For each ref being pushed to `refs/heads/dex/<slug>`, the hook runs the `canPr` check and the tree check from step 3. Any other ref passes.
    - The installer refuses if a `pre-push` hook already exists or `core.hooksPath` is set. In that case it prints the one line to add to the existing hook.
    - `/dex:doctor` reports whether the hook is installed.

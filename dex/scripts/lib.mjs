@@ -16,6 +16,7 @@ import path from 'node:path'
 import os from 'node:os'
 import crypto from 'node:crypto'
 import { execFileSync } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
 
 export const SCHEMA_VERSION = 1
 
@@ -841,11 +842,90 @@ export function workTree(dir, config, slug) {
   })
 }
 
-/** The tree of HEAD, minus the feature's own documents: what a push would publish. */
-export function headTree(dir, config, slug) {
+/** The tree of a commit (HEAD by default), minus the feature's own documents: what a push would publish. */
+export function headTree(dir, config, slug, rev = 'HEAD') {
   if (!isGitRepo(dir)) return null
   trace('headTree', dir)
-  return treeFromIndex(dir, config, slug, (env) => git(['read-tree', 'HEAD'], { cwd: dir, env }))
+  return treeFromIndex(dir, config, slug, (env) => git(['read-tree', rev], { cwd: dir, env }))
+}
+
+// ---------------------------------------------------------------------------
+// The git pre-push hook
+// ---------------------------------------------------------------------------
+
+const PRE_PUSH_MARKER = '# dex pre-push hook'
+export const PRE_PUSH_SCRIPT = path.join(path.dirname(fileURLToPath(import.meta.url)), 'pre-push.mjs')
+
+/** The line to add to an existing pre-push hook so it runs Dex's check too. */
+export function prePushLine() {
+  return `node "${PRE_PUSH_SCRIPT}" "$@" || exit 1`
+}
+
+/**
+ * Whether Dex's pre-push hook is installed in the repository at `root`.
+ * Returns { installed, file, reason }.
+ */
+export function prePushStatus(root) {
+  if (!isGitRepo(root)) return { installed: false, file: null, reason: 'not a git repository' }
+  const custom = git(['config', '--get', 'core.hooksPath'], { cwd: root, allowFail: true })?.trim()
+  const dir = git(['rev-parse', '--path-format=absolute', '--git-path', 'hooks'], { cwd: root, allowFail: true })?.trim()
+  const file = dir ? path.join(dir, 'pre-push') : null
+  if (file && fs.existsSync(file) && fs.readFileSync(file, 'utf8').includes(PRE_PUSH_MARKER)) {
+    return { installed: true, file, reason: null }
+  }
+  if (custom) return { installed: false, file, reason: `core.hooksPath is set to ${custom}`, custom }
+  if (file && fs.existsSync(file)) return { installed: false, file, reason: 'another pre-push hook is already there', foreign: true }
+  return { installed: false, file, reason: 'no pre-push hook' }
+}
+
+/**
+ * Install the hook. It gates pushes of dex/* branches and passes every other
+ * push through. Never overwrites a hook Dex did not write, and never installs
+ * into a custom hooks path: it throws with the one line to add instead.
+ */
+export function installPrePushHook(root) {
+  const status = prePushStatus(root)
+  if (status.installed) {
+    writePrePushHook(status.file)
+    return status
+  }
+  if (!status.file || status.reason === 'not a git repository') throw new DexError('Dex can only install its pre-push hook in a git repository.')
+  const addLine =
+    `Add this line to that hook, near the top and before anything that reads standard input:\n\n  ${prePushLine()}`
+  if (status.custom) {
+    throw new DexError(`Dex will not install its pre-push hook: core.hooksPath is set to ${status.custom}, so hooks are managed elsewhere.\n\n${addLine}`)
+  }
+  if (status.foreign) {
+    throw new DexError(`Dex will not overwrite the existing pre-push hook at ${status.file}.\n\n${addLine}`)
+  }
+  writePrePushHook(status.file)
+  return { installed: true, file: status.file, reason: null }
+}
+
+function writePrePushHook(file) {
+  const script = PRE_PUSH_SCRIPT.replace(/"/g, '\\"')
+  const body = [
+    '#!/bin/sh',
+    `${PRE_PUSH_MARKER}: checks Dex's gates before a dex/* branch is pushed.`,
+    '# Installed by: node <dex>/scripts/state.mjs install-hook',
+    `script="${script}"`,
+    'if [ -f "$script" ]; then',
+    '  exec node "$script" "$@"',
+    'fi',
+    '# The Dex plugin moved or was removed: refuse dex/* pushes, let everything else through.',
+    'while read -r local_ref local_sha remote_ref remote_sha; do',
+    '  case "$remote_ref" in',
+    '    refs/heads/dex/*)',
+    '      echo "Dex: cannot check this dex/* push because $script is missing. Reinstall the hook with: node <dex>/scripts/state.mjs install-hook" >&2',
+    '      exit 1 ;;',
+    '  esac',
+    'done',
+    'exit 0',
+    '',
+  ].join('\n')
+  fs.mkdirSync(path.dirname(file), { recursive: true })
+  fs.writeFileSync(file, body, { mode: 0o755 })
+  fs.chmodSync(file, 0o755)
 }
 
 /** The tree of a commit, or null. */

@@ -51,6 +51,7 @@ import {
   hashFile,
   git,
   ignoreStateRoot,
+  installPrePushHook,
   isGitRepo,
   listFeatures,
   loadConfig,
@@ -1439,6 +1440,14 @@ COMMANDS['diff-hash'] = (ctx, argv) => {
   return {
     text: `dir:    ${dir}\nbase:   ${baseSha ?? '(not pinned)'}\ntree:   ${tree ?? '(none)'}` + (baseSha && tree ? `\n\nRead it:\n  git -C ${dir} diff ${baseSha} ${tree}` : ''),
     json: { dir, baseSha, tree },
+  }
+}
+
+COMMANDS['install-hook'] = (ctx) => {
+  const { file } = installPrePushHook(ctx.root)
+  return {
+    text: `Dex pre-push hook installed at ${file}.\n\nIt checks Dex's gates before any dex/* branch is pushed. Other branches pass untouched.`,
+    json: { file },
   }
 }
 

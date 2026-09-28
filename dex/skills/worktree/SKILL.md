@@ -72,6 +72,17 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/state.mjs" record-worktree <slug> <branch> <
 The script refuses anything but a linked worktree of this repository on the
 named branch, and refuses `HEAD` or the feature branch as the base.
 
+Then install Dex's git pre-push hook. It stops any push of a `dex/*` branch that
+has not passed Dex's gates, however the push is started:
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/state.mjs" install-hook
+```
+
+If it refuses because the repository already has a pre-push hook or uses
+`core.hooksPath`, show the user the line it prints and let them add it. Do not
+edit their hook yourself.
+
 ## 6. Stop
 
 Print the branch, the absolute path, and the base, then:

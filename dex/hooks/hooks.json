@@ -2,12 +2,12 @@
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Write|Edit|MultiEdit|NotebookEdit|Bash",
+        "matcher": "Write|Edit|MultiEdit|NotebookEdit|ApplyPatch|Bash|BashOutput|PowerShell|Shell|mcp__.*",
         "hooks": [
           {
             "type": "command",
             "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/guard.mjs\"",
-            "timeout": 15
+            "timeout": 30
           }
         ]
       }

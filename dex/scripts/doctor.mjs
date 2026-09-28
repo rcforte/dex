@@ -16,6 +16,7 @@ import { fileURLToPath } from 'node:url'
 import {
   DEFAULT_CONFIG,
   findRepoRoot,
+  prePushStatus,
   isGitRepo,
   listFeatures,
   loadConfig,
@@ -144,7 +145,7 @@ export async function runDoctor({ cwd = process.cwd() } = {}) {
   }
 
   const selfFile = path.basename(fileURLToPath(import.meta.url))
-  for (const script of ['lib.mjs', 'state.mjs', 'guard.mjs', 'approve-hook.mjs', 'doctor.mjs', 'status.mjs']) {
+  for (const script of ['lib.mjs', 'shell.mjs', 'commands.mjs', 'state.mjs', 'guard.mjs', 'approve-hook.mjs', 'pre-push.mjs', 'doctor.mjs', 'status.mjs']) {
     const abs = path.join(PLUGIN_ROOT, 'scripts', script)
     if (!fs.existsSync(abs)) {
       add(`Script ${script}`, FAIL, 'missing')
@@ -189,6 +190,17 @@ export async function runDoctor({ cwd = process.cwd() } = {}) {
   } catch (err) {
     config = { ...DEFAULT_CONFIG }
     add('Config', FAIL, err.message.split('\n')[0])
+  }
+
+  if (repo) {
+    const hook = prePushStatus(root)
+    add(
+      'Pre-push hook',
+      hook.installed ? PASS : WARN,
+      hook.installed
+        ? `installed (${hook.file})`
+        : `not installed: ${hook.reason}. /dex:worktree installs it; or run: node ${path.join(PLUGIN_ROOT, 'scripts', 'state.mjs')} install-hook`
+    )
   }
 
   const stateRoot = path.join(root, config.stateRoot)
