@@ -18,7 +18,7 @@ import {
   findRepoRoot,
   prePushStatus,
   isGitRepo,
-  listFeatures,
+  scanFeatures,
   loadConfig,
   normalizeRelPath,
   pad,
@@ -51,13 +51,20 @@ function tryVersion(cmd, args) {
 }
 
 /** Can this directory be written to? Tested by actually writing, not by stat. */
+/**
+ * Whether Dex could create and write `dir`. Looks without writing: checks the
+ * folder, or its nearest existing parent, for write permission.
+ */
 function writableDir(dir) {
+  let probe = path.resolve(dir)
+  while (!fs.existsSync(probe)) {
+    const parent = path.dirname(probe)
+    if (parent === probe) return false
+    probe = parent
+  }
   try {
-    fs.mkdirSync(dir, { recursive: true })
-    const probe = path.join(dir, `.dex-write-probe-${process.pid}`)
-    fs.writeFileSync(probe, 'probe')
-    fs.unlinkSync(probe)
-    return true
+    fs.accessSync(probe, fs.constants.W_OK)
+    return fs.statSync(probe).isDirectory()
   } catch {
     return false
   }
@@ -208,10 +215,19 @@ export async function runDoctor({ cwd = process.cwd() } = {}) {
   const artifactRoot = path.join(root, config.artifactRoot)
   add('Artifact root writable', writableDir(artifactRoot) ? PASS : FAIL, artifactRoot)
 
-  let features = []
   try {
-    features = listFeatures(root, config)
-    add('Features', PASS, features.length ? features.map((f) => `${f.slug} (${f.phase})`).join(', ') : 'none yet — start with /dex:start')
+    const { features, unreadable } = scanFeatures(root, config)
+    const listed = features.map((f) => `${f.slug} (${f.phase})`)
+    if (unreadable.length) {
+      add(
+        'Features',
+        FAIL,
+        `cannot be read: ${unreadable.map((u) => `${u.slug} (${u.error})`).join(', ')}. The guard refuses changes until this is fixed.` +
+          (listed.length ? ` Readable: ${listed.join(', ')}` : '')
+      )
+    } else {
+      add('Features', PASS, listed.length ? listed.join(', ') : 'none yet — start with /dex:start')
+    }
   } catch (err) {
     add('Features', FAIL, err.message.split('\n')[0])
   }

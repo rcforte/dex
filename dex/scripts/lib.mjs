@@ -222,8 +222,16 @@ export function sanitizeSlug(text) {
     .replace(/^-+|-+$/g, '')
     .slice(0, 60)
     .replace(/-+$/, '')
-  return s || 'feature'
+  return s
 }
+
+/** A feature name Dex accepts: lowercase letters, digits and hyphens, at most 60. */
+export function isValidSlug(slug) {
+  return typeof slug === 'string' && /^[a-z0-9][a-z0-9-]{0,59}$/.test(slug)
+}
+
+/** Names that would read as a gate in `approve <gate> <slug>`. */
+export const RESERVED_SLUGS = new Set(['questions', 'design', 'structure', 'code'])
 
 // ---------------------------------------------------------------------------
 // Hashing
@@ -408,6 +416,35 @@ export function ensureConfig(root, stateRoot = '.dex') {
 
 const LOCK_STALE_MS = 120_000
 
+function readLockInfo(lockPath) {
+  try {
+    return JSON.parse(fs.readFileSync(lockPath, 'utf8'))
+  } catch {
+    return null
+  }
+}
+
+/**
+ * How old a lock is, in milliseconds, or null when it is gone.
+ *
+ * A lock whose content is empty or half-written is judged by its file time, so
+ * a lock being written right now is respected. A timestamp in the future means
+ * a clock was wrong; such a lock is treated as stale rather than held forever.
+ */
+function lockAge(lockPath) {
+  let stat
+  try {
+    stat = fs.statSync(lockPath)
+  } catch {
+    return null
+  }
+  const info = readLockInfo(lockPath)
+  const stamped = info && info.acquiredAt ? Date.parse(info.acquiredAt) : NaN
+  const since = Number.isFinite(stamped) ? stamped : stat.mtimeMs
+  const age = Date.now() - since
+  return age < -60_000 ? Infinity : Math.max(age, 0)
+}
+
 /**
  * Exclusive advisory lock for one feature's state.
  *
@@ -416,33 +453,35 @@ const LOCK_STALE_MS = 120_000
  * an interrupted Claude Code session cannot clean up after itself.
  */
 export function withFeatureLock(root, config, slug, fn) {
+  // Checked here too: this is the first place a feature folder gets created.
+  if (!isValidSlug(slug)) throw new DexError(`"${String(slug).slice(0, 80)}" is not a valid feature name.`)
   const dir = featureStateDir(root, config, slug)
   fs.mkdirSync(dir, { recursive: true })
   const lockPath = path.join(dir, '.lock')
   let fd
   let reclaimed = false
-  for (let attempt = 0; attempt < 2; attempt++) {
+  for (let attempt = 0; attempt < 3; attempt++) {
     try {
       fd = fs.openSync(lockPath, 'wx', 0o600)
       break
     } catch (err) {
       if (err.code !== 'EEXIST') throw err
-      let info = null
-      try {
-        info = readJson(lockPath, null)
-      } catch {
-        // A half-written lock reads as garbage; the age check below treats it as stale.
-      }
-      const age = info && info.acquiredAt ? Date.now() - Date.parse(info.acquiredAt) : Infinity
-      if (!Number.isFinite(age) || age > LOCK_STALE_MS) {
+      const age = lockAge(lockPath)
+      if (age === null) continue // it vanished between our attempt and now: try again
+      if (age > LOCK_STALE_MS) {
+        // Reclaim by renaming: of two processes that both see a stale lock, only
+        // one rename succeeds, so only one of them goes on to take it.
+        const grave = `${lockPath}.stale-${process.pid}-${crypto.randomBytes(4).toString('hex')}`
         try {
-          fs.unlinkSync(lockPath)
+          fs.renameSync(lockPath, grave)
+          fs.rmSync(grave, { force: true })
           reclaimed = true
         } catch {
-          // Someone else won the race to reclaim it; the next attempt will fail cleanly.
+          // Someone else reclaimed it first; the next attempt competes normally.
         }
         continue
       }
+      const info = readLockInfo(lockPath)
       throw new DexError(
         `Dex feature "${slug}" is locked by another process (pid ${info?.pid ?? 'unknown'}, held ${Math.round(age / 1000)}s).\n\n` +
           `Two processes must not mutate the same feature state at once.\n\n` +
@@ -497,21 +536,39 @@ const REDACT_KEY = /(secret|token|password|passwd|credential|apikey|api_key|auth
  * token or a connection-string password. Redacting only by key name would miss
  * those, and the event log is durable and may be committed.
  */
+const REDACTED = '[redacted]'
 const REDACT_VALUE = [
-  [/\b(?:Bearer|Basic|Token)\s+[A-Za-z0-9._~+/=-]{8,}/gi, '$& '],
-  [/\b(?:sk|pk|rk|ghp|gho|ghu|ghs|ghr|xox[abprs])[-_][A-Za-z0-9_-]{8,}/g, null],
-  [/\bAKIA[0-9A-Z]{12,}/g, null],
-  [/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+/g, null],
-  [/\b[a-z][a-z0-9+.-]*:\/\/[^\s:@/]+:[^\s@/]+@/gi, null],
-  [/(-{3,}BEGIN [A-Z ]*PRIVATE KEY-{3,})[\s\S]*?(-{3,}END [A-Z ]*PRIVATE KEY-{3,})/g, null],
-  [/((?:password|passwd|pwd|secret|token|api[_-]?key)\s*[=:]\s*)(?:"[^"]+"|'[^']+'|\S+)/gi, null],
+  // Header-style credentials: keep the scheme word, drop the value.
+  [/\b(Bearer|Basic|Token)\s+[A-Za-z0-9._~+/=-]{4,}/gi, `$1 ${REDACTED}`],
+  [/\b(?:sk|pk|rk|ghp|gho|ghu|ghs|ghr|github_pat|glpat|xox[abprs])[-_][A-Za-z0-9_-]{4,}/g, REDACTED],
+  [/\bAKIA[0-9A-Z]{12,}/g, REDACTED],
+  [/\bAIza[0-9A-Za-z_-]{20,}/g, REDACTED],
+  [/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+/g, REDACTED],
+  [/\b([a-z][a-z0-9+.-]*:\/\/[^\s:@/]+:)[^\s@/]+@/gi, `$1${REDACTED}@`],
+  [/(-{3,}BEGIN [A-Z ]*PRIVATE KEY-{3,})[\s\S]*?(-{3,}END [A-Z ]*PRIVATE KEY-{3,})/g, REDACTED],
+  // NAME=value where the name says it is secret: AWS_SECRET_ACCESS_KEY=..., DB_PASSWORD=..., --password=...
+  [/\b([A-Za-z_][A-Za-z0-9_-]*(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|credential)[A-Za-z0-9_-]*\s*[=:]\s*)(?:"[^"]*"|'[^']*'|\S+)/gi, `$1${REDACTED}`],
+  [/(^|[\s"'])((?:password|passwd|pwd|secret|token|api[_-]?key)\s*[=:]\s*)(?:"[^"]*"|'[^']*'|\S+)/gi, `$1$2${REDACTED}`],
+  // curl -u user:pass, --user user:pass
+  [/((?:^|\s)(?:-u|--user)(?:\s+|=)["']?[^\s:"']+:)[^\s"']+/g, `$1${REDACTED}`],
+  // mysql -pSECRET (the password is glued to -p)
+  [/(\b(?:mysql|mysqldump|mysqladmin|mariadb)\b[^\n;|&]*?\s-p)(?=\S)(?!\s)\S+/g, `$1${REDACTED}`],
 ]
 
-/** Replace anything that looks like a credential with a marker. */
+/**
+ * Replace anything that looks like a credential with a marker. Callers scrub
+ * before they shorten text, so a cut can never leave half a secret behind.
+ */
 export function scrubSecrets(text) {
   let out = String(text)
-  for (const [re] of REDACT_VALUE) out = out.replace(re, '[redacted]')
+  for (const [re, replacement] of REDACT_VALUE) out = out.replace(re, replacement)
   return out
+}
+
+/** Scrub, then cut to `max` characters. */
+export function scrubAndClip(text, max) {
+  const s = scrubSecrets(text)
+  return s.length > max ? s.slice(0, max) : s
 }
 
 export function sanitizeDetails(details) {

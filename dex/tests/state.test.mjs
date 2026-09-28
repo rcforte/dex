@@ -81,7 +81,7 @@ test('an existing .dex/config.json is never overwritten', async () => {
 test('questions approval stores the artifact hash', async () => {
   const root = makeRepo()
   await advanceTo(root, 'feat', 'questions')
-  const result = await state(root, ['approve', 'feat', 'questions'])
+  const result = await state(root, ['approve', 'questions', 'feat'])
 
   const approval = readState(root, 'feat').approvals.questions
   assert.equal(approval.approved, true)
@@ -95,7 +95,7 @@ test('questions approval stores the artifact hash', async () => {
 test('approval is refused when the artifact does not exist', async () => {
   const root = makeRepo()
   await advanceTo(root, 'feat', 'questions-approved')
-  const msg = await stateFails(root, ['approve', 'feat', 'design'])
+  const msg = await stateFails(root, ['approve', 'design', 'feat'])
   assert.match(msg, /04-design\.md does not exist or is empty/)
 })
 
@@ -125,7 +125,7 @@ test('re-approving a changed artifact clears staleness and records a reapproval 
   const root = makeRepo()
   await advanceTo(root, 'feat', 'questions-approved')
   write(root, 'docs/dex/feat/02-questions.md', '# changed\n')
-  await state(root, ['approve', 'feat', 'questions'])
+  await state(root, ['approve', 'questions', 'feat'])
 
   const check = await state(root, ['check', 'feat'])
   assert.equal(check.json.gates.questions.status, 'APPROVED')
@@ -154,7 +154,7 @@ test('design cannot be approved before questions are approved', async () => {
   const root = makeRepo()
   await advanceTo(root, 'feat', 'questions')
   write(root, 'docs/dex/feat/04-design.md', '# Design\n')
-  const msg = await stateFails(root, ['approve', 'feat', 'design'])
+  const msg = await stateFails(root, ['approve', 'design', 'feat'])
   assert.match(msg, /will not approve the design while questions are DRAFT/)
 })
 
@@ -162,7 +162,7 @@ test('structure cannot be approved before the design is approved', async () => {
   const root = makeRepo()
   await advanceTo(root, 'feat', 'design')
   write(root, 'docs/dex/feat/05-structure.md', '# Program Structure\n')
-  const msg = await stateFails(root, ['approve', 'feat', 'structure'])
+  const msg = await stateFails(root, ['approve', 'structure', 'feat'])
   assert.match(msg, /will not approve the structure while the design is DRAFT/)
   assert.match(msg, /\/dex:approve design feat/)
 })
@@ -381,7 +381,7 @@ test('human code approval binds to a git tree, and changing the code makes it st
   const { worktree } = await advanceTo(root, 'feat', 'worktree')
   await completeImplementation(root, 'feat', worktree)
 
-  const approved = await state(root, ['approve', 'feat', 'code'])
+  const approved = await state(root, ['approve', 'code', 'feat'])
   assert.match(approved.json.tree, /^[0-9a-f]{40}$/)
   assert.equal(approved.json.baseSha, gitIn(worktree, ['merge-base', 'main', 'HEAD']).trim())
   assert.match(approved.text, /Any further production change voids it/)
@@ -406,7 +406,7 @@ test('a NEW untracked source file invalidates the code approval', async () => {
   const root = makeRepo()
   const { worktree } = await advanceTo(root, 'feat', 'worktree')
   await completeImplementation(root, 'feat', worktree)
-  await state(root, ['approve', 'feat', 'code'])
+  await state(root, ['approve', 'code', 'feat'])
 
   write(worktree, 'src/SneakyBackdoor.java', 'class SneakyBackdoor {}\n')
 
@@ -418,7 +418,7 @@ test('editing Dex artifacts does not invalidate the code approval', async () => 
   const root = makeRepo()
   const { worktree } = await advanceTo(root, 'feat', 'worktree')
   await completeImplementation(root, 'feat', worktree)
-  await state(root, ['approve', 'feat', 'code'])
+  await state(root, ['approve', 'code', 'feat'])
 
   write(root, 'docs/dex/feat/07-implementation-log.md', '# Log\n\n## S2 complete\n')
   write(root, 'docs/dex/feat/08-review.md', '# AI Review\n\nPASS\n')
@@ -432,7 +432,7 @@ test('code approval is refused while verification has not passed', async () => {
   const root = makeRepo()
   const { worktree } = await advanceTo(root, 'feat', 'worktree')
   fs.appendFileSync(path.join(worktree, 'src', 'PortfolioService.java'), '// work\n')
-  const msg = await stateFails(root, ['approve', 'feat', 'code'])
+  const msg = await stateFails(root, ['approve', 'code', 'feat'])
   assert.match(msg, /will not record a human code approval while verification is NOT-RUN/)
 })
 
@@ -444,7 +444,7 @@ test('code approval is refused when there is no diff to approve', async () => {
     await state(root, ['finish-slice', 'feat', id, '--verification', 'mvn test'])
   }
   await state(root, ['verification', 'feat', 'pass', '--command', 'mvn test', '--exit', '0'])
-  const msg = await stateFails(root, ['approve', 'feat', 'code'])
+  const msg = await stateFails(root, ['approve', 'code', 'feat'])
   assert.match(msg, /no production diff to approve/)
 })
 
@@ -467,7 +467,7 @@ test('the PR is blocked until every requirement is satisfied', async () => {
   assert.match(msg, /human code review is REQUIRED/)
   assert.doesNotMatch(msg, /verification is/)
 
-  await state(root, ['approve', 'feat', 'code'])
+  await state(root, ['approve', 'code', 'feat'])
   const created = await state(root, ['record-pr', 'feat', '--url', 'https://example.invalid/pr/7'])
   assert.equal(created.json.pr.created, true)
   assert.equal(readState(root, 'feat').phase, 'complete')
@@ -480,7 +480,7 @@ test('the PR is blocked when the approved diff went stale', async () => {
   const root = makeRepo()
   const { worktree } = await advanceTo(root, 'feat', 'worktree')
   await completeImplementation(root, 'feat', worktree)
-  await state(root, ['approve', 'feat', 'code'])
+  await state(root, ['approve', 'code', 'feat'])
   fs.appendFileSync(path.join(worktree, 'src', 'Optimizer.java'), '// changed after approval\n')
 
   const msg = await stateFails(root, ['record-pr', 'feat'])
@@ -503,7 +503,7 @@ test('requireAiReview false removes the AI review from the PR gate', async () =>
   assert.equal(check.json.gates.canPr.allowed, false)
   assert.deepEqual(check.json.gates.canPr.blockers, ['human code review is REQUIRED'])
 
-  await state(root, ['approve', 'feat', 'code'])
+  await state(root, ['approve', 'code', 'feat'])
   check = await state(root, ['check', 'feat'])
   assert.equal(check.json.gates.canPr.allowed, true)
 })
@@ -531,9 +531,9 @@ test('recorded design drift blocks the feature until the artifact is re-approved
 
   // Re-approving the design unblocks the feature once the structure built on it
   // has been re-approved as well.
-  await state(root, ['approve', 'feat', 'design'])
+  await state(root, ['approve', 'design', 'feat'])
   assert.ok((await state(root, ['check', 'feat'])).json.blocked)
-  const last = await state(root, ['approve', 'feat', 'structure'])
+  const last = await state(root, ['approve', 'structure', 'feat'])
   assert.equal(last.json.unblocked, true)
 
   check = await state(root, ['check', 'feat'])
@@ -562,7 +562,7 @@ test('a held lock refuses a concurrent mutation', async () => {
   const lock = path.join(root, '.dex', 'feat', '.lock')
   fs.writeFileSync(lock, JSON.stringify({ pid: 999999, host: 'other', acquiredAt: new Date().toISOString() }))
 
-  const msg = await stateFails(root, ['approve', 'feat', 'questions'])
+  const msg = await stateFails(root, ['approve', 'questions', 'feat'])
   assert.match(msg, /is locked by another process/)
   assert.match(msg, /Two processes must not mutate the same feature state at once/)
   fs.unlinkSync(lock)
@@ -575,7 +575,7 @@ test('a stale lock is reclaimed', async () => {
   const old = new Date(Date.now() - 10 * 60 * 1000).toISOString()
   fs.writeFileSync(lock, JSON.stringify({ pid: 999999, host: 'other', acquiredAt: old }))
 
-  await state(root, ['approve', 'feat', 'questions'])
+  await state(root, ['approve', 'questions', 'feat'])
   assert.equal(readState(root, 'feat').approvals.questions.approved, true)
   assert.equal(fs.existsSync(lock), false)
 })
@@ -607,7 +607,7 @@ test('every documented lifecycle event can be produced', async () => {
   const { worktree } = await advanceTo(root, 'feat', 'worktree')
   await state(root, ['transition', 'feat', 'research-complete'])
   await completeImplementation(root, 'feat', worktree)
-  await state(root, ['approve', 'feat', 'code'])
+  await state(root, ['approve', 'code', 'feat'])
   await state(root, ['record-pr', 'feat'])
 
   const names = new Set(events(root, 'feat').map((e) => e.event))
@@ -721,7 +721,7 @@ test('code approval is refused outside a git repository', async () => {
     await state(root, ['finish-slice', 'feat', id, '--verification', 'mvn test'])
   }
   await state(root, ['verification', 'feat', 'pass', '--command', 'mvn test', '--exit', '0'])
-  const msg = await stateFails(root, ['approve', 'feat', 'code'])
+  const msg = await stateFails(root, ['approve', 'code', 'feat'])
   assert.match(msg, /is not a git repository/)
   assert.match(msg, /bound to a git tree/)
 })

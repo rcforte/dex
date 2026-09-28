@@ -123,12 +123,12 @@ export async function advanceTo(root, slug, target) {
   write(root, `${d}/01-intent.md`, '# Feature Intent\n\nProblem: optimization is manual.\n')
 
   if (stop >= 1) write(root, `${d}/02-questions.md`, '# Research Questions\n\n1. Where does creation enter?\n')
-  if (stop >= 2) await state(root, ['approve', slug, 'questions'])
+  if (stop >= 2) await state(root, ['approve', 'questions', slug])
   if (stop >= 3) write(root, `${d}/03-research.md`, '# Codebase Research\n\nFACT: src/PortfolioService.java:1-1\n')
   if (stop >= 4) write(root, `${d}/04-design.md`, '# Design\n\nUse PortfolioService.\n')
-  if (stop >= 5) await state(root, ['approve', slug, 'design'])
+  if (stop >= 5) await state(root, ['approve', 'design', slug])
   if (stop >= 6) write(root, `${d}/05-structure.md`, '# Program Structure\n\nTracer bullet required: NO\n')
-  if (stop >= 7) await state(root, ['approve', slug, 'structure'])
+  if (stop >= 7) await state(root, ['approve', 'structure', slug])
   if (stop >= 8) await state(root, ['set-slices', slug, 'S1:tracer — end to end', 'S2:happy path'])
   if (stop >= 9) write(root, `${d}/06-plan.md`, '# Tactical Plan\n\n## Checkpoint S1\n')
 

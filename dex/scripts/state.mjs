@@ -13,7 +13,7 @@
  *   node state.mjs status <slug>
  *   node state.mjs check <slug>                  (JSON gate report)
  *   node state.mjs next <slug>
- *   node state.mjs approve <slug> <questions|design|structure|code>
+ *   node state.mjs approve <questions|design|structure|code> <slug>
  *   node state.mjs transition <slug> <event>
  *   node state.mjs set-slices <slug> <S1:name> [S2:name ...]
  *   node state.mjs start-slice <slug> <id>
@@ -64,7 +64,10 @@ import {
   readActiveSlug,
   readEvents,
   resolveActiveFeature,
+  isValidSlug,
+  RESERVED_SLUGS,
   sanitizeSlug,
+  scrubAndClip,
   saveFeatureState,
   withFeatureLock,
   writeActiveSlug,
@@ -582,6 +585,18 @@ function parseFlags(argv) {
 
 function requireSlug(slug, what) {
   if (!slug) throw new DexError(`Dex needs a feature slug.\n\nUsage: node state.mjs ${what} <feature-slug>\n\nRun "node state.mjs list" to see features.`)
+  return checkSlug(slug)
+}
+
+/** Refuse anything that is not a plain feature name, before any file or folder is touched. */
+function checkSlug(slug) {
+  if (!isValidSlug(slug)) {
+    throw new DexError(
+      `"${String(slug).slice(0, 80)}" is not a valid feature name.\n\n` +
+        `Feature names use lowercase letters, digits and hyphens, start with a letter or digit, and are at most 60 characters.\n\n` +
+        `Run "node state.mjs list" to see features.`
+    )
+  }
   return slug
 }
 
@@ -594,22 +609,32 @@ COMMANDS.init = (ctx, argv) => {
   const title = titleFromFlag || rest.slice(1).join(' ') || slug
   if (!slug) throw new DexError('Usage: node state.mjs init <slug> <title>')
   slug = sanitizeSlug(slug)
+  if (!slug) {
+    throw new DexError(
+      `Dex could not make a feature name (slug) from "${rest[0]}": it has no ASCII letters or digits.\n\n` +
+        `Give the slug in English, and the title as you like:\n  node state.mjs init portfolio-export --title "${rest[0]}"`
+    )
+  }
+  if (RESERVED_SLUGS.has(slug)) {
+    throw new DexError(`"${slug}" is reserved: it is the name of an approval gate. Choose another feature name.`)
+  }
   const { root, config } = ctx
   ensureConfig(root, config.stateRoot)
   ignoreStateRoot(root, config)
   const statePath = path.join(featureStateDir(root, config, slug), 'state.json')
-  if (fs.existsSync(statePath)) {
-    const existing = loadFeatureState(root, config, slug)
-    const gates = computeGates(root, config, existing)
-    return {
-      text:
-        `Feature "${slug}" already exists (phase ${existing.phase}).\n\n` +
-        `Dex will not overwrite an in-flight feature.\n\n` +
-        `Resume it:\n  /dex:resume ${slug}\n\nNext legal action:\n  ${nextAction(root, config, existing, gates).command}`,
-      json: { slug, created: false, phase: existing.phase },
-    }
-  }
+  // Check and create under the lock, so two init commands cannot both create it.
   return withFeatureLock(root, config, slug, () => {
+    if (fs.existsSync(statePath)) {
+      const existing = loadFeatureState(root, config, slug)
+      const gates = computeGates(root, config, existing)
+      return {
+        text:
+          `Feature "${slug}" already exists (phase ${existing.phase}).\n\n` +
+          `Dex will not overwrite an in-flight feature.\n\n` +
+          `Resume it:\n  /dex:resume ${slug}\n\nNext legal action:\n  ${nextAction(root, config, existing, gates).command}`,
+        json: { slug, created: false, phase: existing.phase },
+      }
+    }
     const state = newFeatureState(slug, title, config)
     fs.mkdirSync(artifactDir(root, config, slug), { recursive: true })
     state.phase = 'initialized'
@@ -674,19 +699,13 @@ COMMANDS.next = (ctx, argv) => {
 
 COMMANDS.approve = (ctx, argv) => {
   const { flags, rest } = parseFlags(argv)
-  let [a, b] = rest
-  // Accept both "approve <slug> <gate>" and "approve <gate> <slug>".
-  const gateNames = new Set(['questions', 'design', 'structure', 'code'])
-  let slug = a
-  let gate = b
-  if (gateNames.has(a)) {
-    gate = a
-    slug = b
+  const [gate, rawSlug] = rest
+  if (!RESERVED_SLUGS.has(gate)) {
+    throw new DexError(
+      `"${gate ?? ''}" is not an approval gate.\n\nUsage: node state.mjs approve <gate> <slug>\n\nGates: questions, design, structure, code`
+    )
   }
-  slug = requireSlug(slug, 'approve <gate>')
-  if (!gateNames.has(gate)) {
-    throw new DexError(`Unknown approval gate "${gate ?? ''}".\n\nValid gates: questions, design, structure, code\n\nUsage: node state.mjs approve <slug> <gate>`)
-  }
+  const slug = requireSlug(rawSlug, 'approve <gate>')
   const { root, config } = ctx
   return withFeatureLock(root, config, slug, () => {
     const state = loadFeatureState(root, config, slug)
@@ -1067,8 +1086,8 @@ COMMANDS['finish-slice'] = (ctx, argv) => {
     }
     slice.status = 'complete'
     slice.completedAt = nowIso()
-    slice.verification = String(flags.verification)
-    if (typeof flags.note === 'string') slice.note = flags.note
+    slice.verification = scrubAndClip(flags.verification, 400)
+    if (typeof flags.note === 'string') slice.note = scrubAndClip(flags.note, 1000)
     const gates = refreshPhase(root, config, state)
     saveFeatureState(root, config, slug, state)
     appendEvent(root, config, slug, 'slice_implemented', { slice: slice.id, verification: slice.verification })
@@ -1100,7 +1119,7 @@ COMMANDS['block-slice'] = (ctx, argv) => {
     const state = loadFeatureState(root, config, slug)
     const slice = findSlice(state, rest[1])
     slice.status = 'blocked'
-    slice.note = String(flags.reason)
+    slice.note = scrubAndClip(flags.reason, 1000)
     refreshPhase(root, config, state)
     saveFeatureState(root, config, slug, state)
     appendEvent(root, config, slug, 'slice_blocked', { slice: slice.id, reason: slice.note })
@@ -1133,10 +1152,10 @@ COMMANDS.verification = (ctx, argv) => {
       commands = [{ command: flags.command, exitCode: flags.exit === undefined ? null : Number(flags.exit) }]
     }
     commands = commands.map((c) => ({
-      command: String(c.command ?? '').slice(0, 400),
+      command: scrubAndClip(c.command ?? '', 400),
       exitCode: c.exitCode === null || c.exitCode === undefined ? null : Number(c.exitCode),
       category: c.category ? String(c.category).slice(0, 40) : null,
-      summary: c.summary ? String(c.summary).slice(0, 600) : null,
+      summary: c.summary ? scrubAndClip(c.summary, 600) : null,
     }))
     if (result === 'reset') {
       state.verification = { status: 'not-run', commands: [], lastResult: null, ranAt: null }
@@ -1160,7 +1179,7 @@ COMMANDS.verification = (ctx, argv) => {
       state.verification = {
         status: result === 'pass' ? 'passed' : 'failed',
         commands,
-        lastResult: typeof flags.summary === 'string' ? String(flags.summary).slice(0, 2000) : null,
+        lastResult: typeof flags.summary === 'string' ? scrubAndClip(flags.summary, 2000) : null,
         ranAt: nowIso(),
         tree: workTree(featureDir(root, state), config, slug),
       }
@@ -1336,7 +1355,7 @@ COMMANDS.drift = (ctx, argv) => {
     const state = loadFeatureState(root, config, slug)
     const slice = flags.slice === undefined ? null : findSlice(state, flags.slice)
     state.blocked = {
-      reason: String(flags.reason).slice(0, 1000),
+      reason: scrubAndClip(flags.reason, 1000),
       target: flags.target,
       slice: slice ? slice.id : null,
       since: nowIso(),
@@ -1416,6 +1435,7 @@ COMMANDS.active = (ctx, argv) => {
   const { rest } = parseFlags(argv)
   const { root, config } = ctx
   if (rest[0]) {
+    checkSlug(rest[0])
     loadFeatureState(root, config, rest[0])
     writeActiveSlug(root, config, rest[0])
     return { text: `Active feature set to "${rest[0]}".`, json: { active: rest[0] } }
