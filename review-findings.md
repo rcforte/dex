@@ -2,6 +2,8 @@
 
 **Date:** 2026-09-27
 
+> **Status, 2026-09-28:** all 41 findings are fixed, each with tests. The fixes are the commits listed under each finding. The open questions at the end were answered in the Decisions table of `implementation-plan.md`. Checks that need a real Claude Code session are listed in `dex/tests/LIVE-CHECKS.md`.
+
 ## Summary
 
 The gates can be bypassed, and the normal happy path breaks twice.
@@ -31,6 +33,7 @@ Fix the critical findings 1 to 3 first. Most of the pattern fixes further down m
 ## Critical
 
 ### 1. The model can approve its own work
+**Fixed** in `83e72f8`. Tests: `dex/tests/approval.test.mjs`.
 **Confirmed.** `scripts/guard.mjs`, `scripts/state.mjs`, `skills/approve/SKILL.md`
 
 `/dex:approve` is marked user-only, but nothing stops the model from running the script behind it. A Bash call to `node scripts/state.mjs approve <slug> code` is allowed. It prints "APPROVED: human code review", and `git push` then goes through. The same works for `design` and `structure`.
@@ -41,6 +44,7 @@ Fix the critical findings 1 to 3 first. Most of the pattern fixes further down m
 - **Test:** A Bash call to `state.mjs approve <slug> code` is not silently allowed.
 
 ### 2. The model can rewrite the state the gates read
+**Fixed** in `83e72f8`, `c9bbd12`. Tests: `dex/tests/approval.test.mjs`.
 **Confirmed.** `guard.mjs:164,178,316`, `tests/guard.test.mjs:105`
 
 The guard allows writes to `.dex/**` in every phase, and a test locks that in. Two examples:
@@ -53,6 +57,7 @@ Setting `artifactRoot: "src"` in the config makes every production file count as
 - **Test:** Write, Edit and `echo … >` into `.dex/config.json` and `.dex/<slug>/state.json` are denied.
 
 ### 3. Dex switches off inside the worktree
+**Fixed** in `a9ee2f1`. Tests: `dex/tests/repo-root.test.mjs`, `dex/tests/e2e.test.mjs`.
 **Confirmed.** `lib.mjs:124-144` (`findRepoRoot`), `guard.mjs:378`, `skills/implement/SKILL.md:51`, `skills/verify/SKILL.md:25`, `skills/worktree/SKILL.md:48`
 
 `findRepoRoot` uses `git rev-parse --show-toplevel`. Inside a worktree, that returns the worktree's own root. The worktree has no `.dex/` folder, so no feature is found.
@@ -67,6 +72,7 @@ The worktree skill recommends Claude Code's built-in worktree, which moves the w
 - **Test:** Run `state.mjs check` and the guard with the working directory set to a linked worktree. Expect the feature to be found and a push denied.
 
 ### 4. `/dex:pr` makes its own code approval stale
+**Fixed** in `1a0a002`. Tests: `dex/tests/code-hash.test.mjs`, `dex/tests/e2e.test.mjs`.
 **Confirmed.** `skills/pr/SKILL.md:50-53`, `lib.mjs:724-768` (`diffFingerprint`)
 
 The code approval is a hash of two things: `git diff <base>` and the list of untracked files. `/dex:pr` runs `git add -A` first. That turns new files from untracked into tracked, which changes the hash. The approval goes STALE and the guard refuses the push. The PR can never go out as written.
@@ -75,6 +81,7 @@ The code approval is a hash of two things: `git diff <base>` and the list of unt
 - **Test:** Approve code, then `add`, `commit` and `push` in the worktree. The push is allowed.
 
 ### 5. What gets pushed is not what was approved
+**Fixed** in `1a0a002`. Tests: `dex/tests/code-hash.test.mjs`.
 **Confirmed.** `lib.mjs:724-760`, `state.mjs:610,1030`
 
 The hash compares the base with the working tree, not with the commit being pushed. Four ways this goes wrong:
@@ -94,6 +101,7 @@ The hash compares the base with the working tree, not with the commit being push
   `--base HEAD` is refused.
 
 ### 6. Code can hide from review in the Dex folders
+**Fixed** in `1a0a002`. Tests: `dex/tests/code-hash.test.mjs`.
 **Confirmed.** `lib.mjs:728-732`, `lib.mjs:361-366` (config validation)
 
 The code hash skips everything under `docs/dex/**` and `.dex/**`, not just Dex's own markdown files. Examples:
@@ -105,6 +113,7 @@ The code hash skips everything under `docs/dex/**` and `.dex/**`, not just Dex's
 - **Test:** A `.java` file under `docs/dex/` changes the hash. `artifactRoot: "."` and `"../x"` are rejected.
 
 ### 7. A corrupt state file turns every gate off
+**Fixed** in `83e72f8`. Tests: `dex/tests/approval.test.mjs`.
 **Confirmed.** `lib.mjs:248-253` (`readJson`), `guard.mjs:269`, `guard.mjs:424-439`
 
 `readJson` returns its fallback for invalid JSON as well as for a missing file. So a truncated `state.json` makes the feature disappear. `list` then says "No Dex features", and the guard allows production writes and `git push`.
@@ -115,6 +124,7 @@ Malformed config or state, such as `[]`, also crashes the guard. It then fails o
 - **Test:** Corrupt `state.json`, then check that a Write to `src/`, `git push` and `sh -c "git push"` are all denied.
 
 ### 8. The PR gate does not re-check design, structure, plan or worktree
+**Fixed** in `943c223`. Tests: `dex/tests/gates.test.mjs`.
 **Confirmed.** `state.mjs:227-242` (`canPr`)
 
 Take a feature ready for a PR. Edit the design and the structure, and delete the plan and the worktree. `check` shows design and structure as STALE, yet `canPr` is still true and `git push` is allowed. The same staleness does block code edits.
@@ -125,6 +135,7 @@ With `strictGates: false`, a PR can go out with no design or structure approval 
 - **Test:** Each of these blocks `canPr`: a stale design, a stale structure, a missing plan, a missing worktree.
 
 ### 9. Research fails on every run
+**Fixed** in `567e865`. Tests: `dex/tests/workflows-run.test.mjs`.
 **Confirmed by the Claude Code docs.** `workflows/research.js:177,369`, `workflows/review.js:402`
 
 The workflows run `node "$CLAUDE_PLUGIN_ROOT/scripts/state.mjs"` inside agent shells. Claude Code substitutes `${CLAUDE_PLUGIN_ROOT}` in skill text. The docs say it is not exported to commands run through the Bash tool, by the main session or by subagents. An `echo` test agreed. So the path becomes `/scripts/state.mjs`, the gate check fails, and research returns `ok: false` every time. The skill then does not say what to do (see finding 22).
@@ -137,6 +148,7 @@ The workflows run `node "$CLAUDE_PLUGIN_ROOT/scripts/state.mjs"` inside agent sh
 ## High
 
 ### 10. `/dex:worktree` always stops on its own check
+**Fixed** in `a9ee2f1`. Tests: `dex/tests/repo-root.test.mjs`, `dex/tests/e2e.test.mjs`.
 **Confirmed.** `skills/worktree/SKILL.md:26-33`
 
 After `/dex:start`, `git status --porcelain` always shows `?? .dex/` and `?? docs/`. The skill says to stop when the tree has uncommitted changes, so every run stops.
@@ -145,6 +157,7 @@ After `/dex:start`, `git status --porcelain` always shows `?? .dex/` and `?? doc
 - **Test:** A fresh `init`, then the worktree precondition, passes.
 
 ### 11. Verification and AI review are not tied to the code they checked
+**Fixed** in `1a0a002`. Tests: `dex/tests/code-hash.test.mjs`.
 **Confirmed.** `state.mjs:906-1010`
 
 Record a passing verification. Then replace `src/a.js` with broken code and record a passing review. Verification still shows PASS, and the PR is allowed.
@@ -153,6 +166,7 @@ Record a passing verification. Then replace `src/a.js` with broken code and reco
 - **Test:** Change code after a passing verification. Verification is no longer PASS.
 
 ### 12. Implementation can start while the questions approval is stale
+**Fixed** in `943c223`. Tests: `dex/tests/gates.test.mjs`.
 **Confirmed.** `state.mjs:219-225` (`canImplement`)
 
 After everything is approved, edit `02-questions.md`. `check` shows questions as STALE and `next` says to re-approve them. But `canImplement` is still true.
@@ -161,6 +175,7 @@ After everything is approved, edit `02-questions.md`. `check` shows questions as
 - **Test:** Stale questions block `canImplement`.
 
 ### 13. `git push` detection is easy to bypass
+**Fixed** in `b699e42`. Tests: `dex/tests/shell-guard.test.mjs`.
 **Confirmed.** `guard.mjs:47-55` (publish patterns), `guard.mjs:141-150` (`stripPrefixes`)
 
 All of these were allowed when a push should have been denied:
@@ -176,6 +191,7 @@ All of these were allowed when a push should have been denied:
 - **Test:** One case per bullet above.
 
 ### 14. Paths with `..` or symlinks get past the edit check
+**Fixed** in `b699e42`. Tests: `dex/tests/shell-guard.test.mjs`.
 **Confirmed.** `lib.mjs:99-116` (`normalizeRelPath`), `guard.mjs:162`
 
 All of these were allowed during design:
@@ -192,6 +208,7 @@ Relative paths are resolved against the repo root instead of the shell's working
 - **Test:** One case per bullet, plus the two cases from `src/`.
 
 ### 15. Tools outside the hook's matcher are never checked
+**Fixed** in `b699e42`. Tests: `dex/tests/shell-guard.test.mjs`.
 **Confirmed.** `hooks/hooks.json:5`, `guard.mjs:36-37`
 
 The matcher is `Write|Edit|MultiEdit|NotebookEdit|Bash`. The guard's code knows `ApplyPatch`, `PowerShell` and `Shell`, but the hook never fires for them. MCP tools that write files, such as `mcp__filesystem__write_file`, are also unchecked. Even when given to the guard directly, `ApplyPatch` and `PowerShell Set-Content` are allowed.
@@ -200,6 +217,7 @@ The matcher is `Write|Edit|MultiEdit|NotebookEdit|Bash`. The guard's code knows 
 - **Test:** Every tool name in the guard's tool sets matches the hook matcher.
 
 ### 16. The guard does nothing when the plugin path has a symlink, `#` or `%`
+**Fixed** in `b699e42`. Tests: `dex/tests/shell-guard.test.mjs`.
 **Confirmed.** `guard.mjs:409`, `state.mjs:1230`
 
 The "am I the main script?" check compares `argv[1]` with `import.meta.url`. Through a symlinked plugin folder, or a path containing `#` or `%`, the two differ. The guard then exits with no output, which counts as "allow".
@@ -208,6 +226,7 @@ The "am I the main script?" check compares `argv[1]` with `import.meta.url`. Thr
 - **Test:** Run the guard through a symlink. A design-phase write to `src/` is denied.
 
 ### 17. Research silently drops questions past the sixth
+**Fixed** in `567e865`. Tests: `dex/tests/workflows-run.test.mjs`.
 **Confirmed.** `workflows/research.js:238`, `skills/questions/SKILL.md:65`, `README.md:416`
 
 The questions skill asks for 6–12 questions. Research runs only the first `maxResearchWorkers` (default 6). The rest appear only in a log line. They are missing from the report, from `failedQuestions`, and from the returned result. The README says they are "listed as unanswered".
@@ -218,6 +237,7 @@ Questions a human adds under "Human Notes" are parsed and then dropped (`researc
 - **Test:** With 8 questions and a limit of 6, all 8 appear in the result.
 
 ### 18. Research isolation is instructed, not enforced
+**Fixed** in `567e865`. Tests: `dex/tests/workflows-run.test.mjs`.
 **Confirmed.** `workflows/research.js:257-270`, `README.md:404`
 
 Probes have default tools. A plain search for a domain word will find `docs/dex/<slug>/01-intent.md` and `04-design.md`, and older features' files. The README says research agents "have no write tools at all". On the workflow path that is false.
@@ -226,6 +246,7 @@ Probes have default tools. A plain search for a domain word will find `docs/dex/
 - **Test:** The workflow gives probes an agent type or a tool list, and that list has no write tools.
 
 ### 19. Most commands never set the active feature
+**Fixed** in `83e72f8`. Tests: `dex/tests/approval.test.mjs`.
 **Confirmed by reading the code.** `guard.mjs`, `state.mjs`
 
 The guard checks only the feature named in `.dex/active`. Only `init`, `transition` and `active` write that file. So `/dex:implement B` or `/dex:pr B`, run while feature A is active, is checked against A's state. That can wrongly allow B's edits and push, or wrongly refuse them.
@@ -240,6 +261,7 @@ With two active features, a stale `.dex/active` allows everything, including `rm
 ## Medium
 
 ### 20. After drift, unblocking needs no re-approval, and no command does it
+**Fixed** in `943c223`. Tests: `dex/tests/gates.test.mjs`.
 **Confirmed.** `state.mjs:1100-1124`, all skills
 
 "Drift" is when the code contradicts the design during implementation. It marks the feature blocked.
@@ -259,6 +281,7 @@ Smaller problems:
 - **Test:** `drift` then `unblock` is refused. `drift`, re-approve, then `unblock` succeeds.
 
 ### 21. Checkpoint recording has no rules
+**Fixed** in `943c223`. Tests: `dex/tests/gates.test.mjs`.
 **Confirmed.** `state.mjs:753-904`
 
 A checkpoint is one of the S1, S2, … steps from the structure.
@@ -275,6 +298,7 @@ A checkpoint is one of the S1, S2, … steps from the structure.
 - **Test:** One case per bullet.
 
 ### 22. Research and review skills ignore failures and write reports twice
+**Fixed** in `567e865`. Tests: `dex/tests/workflows-run.test.mjs`.
 **Suspected.** `skills/research/SKILL.md:31,61`, `skills/review/SKILL.md:43-44,62`, `workflows/review.js:39,143-147,213`
 
 Both workflows write their report file themselves. The skills then tell Claude to write it again. Neither skill says what to do when the workflow returns `ok: false`.
@@ -294,6 +318,7 @@ The review path has three more problems:
 - **Test:** Check that every dimension named in the review skill is a key in `review.js`.
 
 ### 23. Turning `requireWorktree` on or off after `/dex:start` does nothing
+**Fixed** in `a9ee2f1`. Tests: `dex/tests/repo-root.test.mjs`.
 **Confirmed.** `lib.mjs:582` (`newFeatureState`), `state.mjs:186,1012-1041`, `skills/worktree/SKILL.md:21`
 
 The setting is copied into the feature when it is created, and never read again. The worktree skill tells Claude to read the live config, so the skill and the gate disagree.
@@ -304,6 +329,7 @@ The setting is copied into the feature when it is created, and never read again.
 - **Test:** Changing the config after `init` changes the gate. `record-worktree <slug> main .` is refused.
 
 ### 24. Secrets leak into the event log and into `state.json`
+**Fixed** in `ec315a8`. Tests: `dex/tests/hygiene.test.mjs`.
 **Confirmed.** `lib.mjs:467-482`, `state.mjs:863-866,930-959,1075`
 
 These reached `events.jsonl` unredacted:
@@ -325,6 +351,7 @@ These reached `events.jsonl` unredacted:
 - **Test:** One case per leaked form above, checked in both `events.jsonl` and `state.json`.
 
 ### 25. A slug containing `..` reaches the filesystem
+**Fixed** in `ec315a8`. Tests: `dex/tests/hygiene.test.mjs`.
 **Confirmed.** `state.mjs:496`, `lib.mjs:396`
 
 Only `init` cleans the slug. `approve ../../escaped design` fails, but only after creating a folder outside the repo. `status ../.dex/foo` reads a real feature through the path.
@@ -333,6 +360,7 @@ Only `init` cleans the slug. `approve ../../escaped design` fails, but only afte
 - **Test:** `approve ../x design` fails and creates nothing.
 
 ### 26. The guard refuses harmless commands during design
+**Fixed** in `b699e42`. Tests: `dex/tests/shell-guard.test.mjs`.
 **Confirmed.** `guard.mjs:61-115` and the command splitter
 
 - **Test and build logs:** saving a log into the repo is denied, e.g. `npm test > test-output.log` or `mvn test 2>&1 | tee build.log`. Running tests is supposed to be allowed.
@@ -345,6 +373,7 @@ Only `init` cleans the slug. `approve ../../escaped design` fails, but only afte
 - **Test:** One case per bullet.
 
 ### 27. The guard misses many ways to change files during design
+**Fixed** in `b699e42`. Tests: `dex/tests/shell-guard.test.mjs`.
 **Confirmed.** `guard.mjs:61-115`
 
 Allowed during design:
@@ -363,6 +392,7 @@ The code comments accept some misses. But several of these differ from a blocked
 - **Test:** One case per item.
 
 ### 28. Lock handling has gaps
+**Fixed** in `ec315a8`. Tests: `dex/tests/hygiene.test.mjs`.
 **Confirmed except where noted.** `lib.mjs:400-423`
 
 - An empty lock file is treated as stale and deleted at once. An empty file is what exists between creating the lock and writing to it.
@@ -374,6 +404,7 @@ The code comments accept some misses. But several of these differ from a blocked
 - **Test:** An empty fresh lock is respected. A future-dated lock is reclaimed.
 
 ### 29. `approve` gets confused when a feature has a gate's name
+**Fixed** in `ec315a8`. Tests: `dex/tests/hygiene.test.mjs`.
 **Confirmed.** `state.mjs:576-584`
 
 `approve` accepts its two arguments in either order. With features named `code` and `design`, `approve code design` approved the code gate of feature "design".
@@ -382,6 +413,7 @@ The code comments accept some misses. But several of these differ from a blocked
 - **Test:** `init code` is refused.
 
 ### 30. The diff-reading guide shows a different diff from what gets approved
+**Fixed** in `1a0a002`. Tests: `dex/tests/code-hash.test.mjs`.
 **Confirmed.** `status.mjs:34-61,139`
 
 - With no worktree recorded, `status --review` shows only unstaged changes, while `approve` compares against `main`.
@@ -396,17 +428,17 @@ The code comments accept some misses. But several of these differ from a blocked
 
 ## Low
 
-- **31. Doctor writes to the repo.** It creates `.dex/` and `docs/dex/` in any repo it inspects, and follows a `..` config outside it. **Confirmed.** `doctor.mjs`
-- **32. Doctor misses corrupt state.** It reports "Features: none yet" when a `state.json` is corrupt. **Confirmed.**
-- **33. Unicode slugs collide.** `init "日本語"` and `init "中文"` both become `feature`. **Confirmed.**
-- **34. Mixed-case slugs don't resolve.** They are lowercased only at `init`, so `status Foo` fails. **Confirmed.**
-- **35. `drift` leaves the phase out of date.** It does not call `refreshPhase`. **Confirmed.**
-- **36. An emptied approved file shows MISSING, not STALE.** No stale warning appears. **Confirmed.**
-- **37. The structure's tracer line is never read.** `Tracer bullet required:` in the structure file is never parsed. The tracer is guessed from the word "tracer" in the checkpoint name. Nothing checks that checkpoint ids match the structure. **Confirmed.**
-- **38. Roots are hard-coded in two places.** `review.js` uses `docs/dex` and `.dex` instead of the configured roots. `loadConfig` always reads `.dex/config.json` even when `stateRoot` differs. **Confirmed.**
-- **39. Old tool name in skills.** Several skills list `Task` in `allowed-tools`; the subagent tool is now called `Agent`. **Suspected.**
-- **40. The hook fails open when it is slow.** After code approval, every checked call runs `git diff` and hashes all untracked files. The hook timeout is 15 s. A timeout, or `node` missing from PATH, fails open, push included. **Suspected.** `state.mjs:136-154`
-- **41. False publish matches.** `git log --grep send-email` and `git push-to-checkout` match the publish patterns. **Confirmed.**
+- **31. Doctor writes to the repo.** It creates `.dex/` and `docs/dex/` in any repo it inspects, and follows a `..` config outside it. **Confirmed.** `doctor.mjs` **Fixed** in `ec315a8`. Tests: `dex/tests/hygiene.test.mjs`.
+- **32. Doctor misses corrupt state.** It reports "Features: none yet" when a `state.json` is corrupt. **Confirmed.** **Fixed** in `ec315a8`. Tests: `dex/tests/hygiene.test.mjs`.
+- **33. Unicode slugs collide.** `init "日本語"` and `init "中文"` both become `feature`. **Confirmed.** **Fixed** in `ec315a8`. Tests: `dex/tests/hygiene.test.mjs`.
+- **34. Mixed-case slugs don't resolve.** They are lowercased only at `init`, so `status Foo` fails. **Confirmed.** **Fixed** in `ec315a8`. Tests: `dex/tests/hygiene.test.mjs`.
+- **35. `drift` leaves the phase out of date.** It does not call `refreshPhase`. **Confirmed.** **Fixed** in `943c223`. Tests: `dex/tests/gates.test.mjs`.
+- **36. An emptied approved file shows MISSING, not STALE.** No stale warning appears. **Confirmed.** **Fixed** in `943c223`. Tests: `dex/tests/gates.test.mjs`.
+- **37. The structure's tracer line is never read.** `Tracer bullet required:` in the structure file is never parsed. The tracer is guessed from the word "tracer" in the checkpoint name. Nothing checks that checkpoint ids match the structure. **Confirmed.** **Fixed** in `567e865`. Tests: `dex/tests/workflows-run.test.mjs`.
+- **38. Roots are hard-coded in two places.** `review.js` uses `docs/dex` and `.dex` instead of the configured roots. `loadConfig` always reads `.dex/config.json` even when `stateRoot` differs. **Confirmed.** **Fixed** in `1a0a002`, `3232b61`. Tests: `dex/tests/code-hash.test.mjs`, `dex/tests/hygiene.test.mjs`.
+- **39. Old tool name in skills.** Several skills list `Task` in `allowed-tools`; the subagent tool is now called `Agent`. **Suspected.** **Fixed** in `567e865`. Tests: `dex/tests/workflows-run.test.mjs`.
+- **40. The hook fails open when it is slow.** After code approval, every checked call runs `git diff` and hashes all untracked files. The hook timeout is 15 s. A timeout, or `node` missing from PATH, fails open, push included. **Suspected.** `state.mjs:136-154` **Fixed** in `1a0a002`, `b699e42`. Tests: `dex/tests/code-hash.test.mjs`, `dex/tests/shell-guard.test.mjs`.
+- **41. False publish matches.** `git log --grep send-email` and `git push-to-checkout` match the publish patterns. **Confirmed.** **Fixed** in `b699e42`. Tests: `dex/tests/shell-guard.test.mjs`.
 
 ---
 
@@ -422,7 +454,7 @@ The code comments accept some misses. But several of these differ from a blocked
 
 ## Open questions
 
-These need a decision from you before some fixes can be made.
+All answered; see the Decisions table in `implementation-plan.md`.
 
 1. **Trust boundary.** Should the model be physically unable to record an approval or edit `.dex/`? Or is an instruction enough? Findings 1, 2 and 7 depend on this. The README's "enforced with a program" claim implies the former.
 2. **Where commands run.** Should everything run from the main checkout? Or should Dex state be reachable from the worktree? This decides the fix for finding 3.

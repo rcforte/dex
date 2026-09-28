@@ -93,19 +93,19 @@ PR
 | ------- | ------------ |
 | `/dex:start <description>` | Capture the problem as `01-intent.md` and initialize state. No research, no design, no code. |
 | `/dex:questions <slug>` | Turn intent into objective research questions in `02-questions.md`. Does not answer them. |
-| `/dex:approve questions <slug>` | Record human approval of the question list, bound to its hash. |
+| `/dex:approve questions <slug>` | Record human approval of the question list, bound to its hash. Only you can approve: the approval is recorded when you type the command. |
 | `/dex:research <slug>` | Fan out isolated probes, verify their findings adversarially, synthesize `03-research.md`. |
 | `/dex:design <slug>` | Interactive design discussion. Surfaces competing patterns and maintains `04-design.md`. |
 | `/dex:approve design <slug>` | **Human gate.** Record approval of the design. |
 | `/dex:structure <slug>` | Program structure and vertical checkpoints in `05-structure.md`. |
 | `/dex:approve structure <slug>` | **Human gate.** Record approval of the structure. |
 | `/dex:plan <slug>` | Tactical implementation plan `06-plan.md` and the checkpoint list in state. |
-| `/dex:worktree <slug>` | Create an isolated git worktree and branch. Never discards uncommitted work. |
+| `/dex:worktree <slug>` | Create an isolated git worktree and branch next to the repository, and install the git pre-push hook. Never discards uncommitted work. |
 | `/dex:implement <slug> [Sn]` | Implement one checkpoint, verify it, log it, then stop. |
 | `/dex:verify <slug>` | Run the project's real verification commands and persist the exit codes. |
 | `/dex:review <slug>` | Independent multi-angle AI review into `08-review.md`. Records no approval. |
-| `/dex:approve code <slug>` | **Human gate.** Record that a human read the production diff, bound to a diff hash. |
-| `/dex:pr <slug>` | Prepare and optionally create the pull request. The only command that may push. |
+| `/dex:approve code <slug>` | **Human gate.** Record that a human read the production diff, bound to the exact code (a git tree). |
+| `/dex:pr <slug>` | Prepare and optionally create the pull request, with the feature documents included. The only command that may push. |
 | `/dex:status <slug>` | The gate board, stale approvals, and the next legal action. |
 | `/dex:next <slug>` | Just the next legal command, computed by the state machine. |
 | `/dex:resume <slug>` | Resume in a fresh context, loading only what the next phase needs. |
@@ -289,37 +289,78 @@ beats the implementation summary.
 
 If implementation discovers that the repository invalidates the approved design,
 it records **design drift** and the feature blocks until a human revises and
-re-approves the affected artifact. Silently improvising a different architecture
+re-approves the affected artifact. Dex unblocks the feature by itself once every
+document approval is current again. Silently improvising a different architecture
 is how a feature ends up as something nobody approved.
 
 ## What is enforced deterministically
 
-A `PreToolUse` hook (`scripts/guard.mjs`) reads each tool call and the state
-machine, and refuses two things:
+Two hooks and a git hook enforce the gates. Prompts only describe them.
 
-1. **Production code modification** before design and structure are approved, a
-   plan exists, and the worktree is ready. Writes to `docs/dex/**` and `.dex/**`
-   stay allowed. Shell mutations — `git commit`, `rm`, `mv`, `sed -i`, package
-   installs, database migrations, redirects into source — are refused too.
-2. **Push and pull-request creation** until implementation is complete,
-   verification passed, AI review has no unresolved blockers, and the human code
-   approval is current.
+**Approvals come only from you.** A `UserPromptSubmit` hook
+(`scripts/approve-hook.mjs`) sees the text you type before the model does. When
+it is exactly `/dex:approve <gate> <slug>`, the hook records the approval. The
+model cannot trigger this hook, cannot run the approve command itself, and cannot
+write to `.dex/`, where approvals and gate state live. As a backup you can run
+`node <dex>/scripts/state.mjs approve <gate> <slug>` in your own terminal.
+
+**A `PreToolUse` hook (`scripts/guard.mjs`)** reads each tool call and the state
+machine. It refuses three things:
+
+1. **Recording an approval or writing to `.dex/`**, in every phase.
+2. **Changing the repository** before the questions, design and structure are
+   approved and current, the plan exists and the worktree is ready. Writing inside
+   `docs/dex/` stays allowed. Shell changes are refused too: `git commit`, `rm`,
+   `mv`, `touch`, `sed -i`, formatters that rewrite files, package installs,
+   database migrations, redirects into the repository, and inline scripts that
+   write files.
+3. **Publishing** until every approval is current, implementation is complete,
+   verification passed on the current code, AI review passed on the current code,
+   the human approved the current code, and HEAD holds exactly that code.
+   Publishing means `git push` in any form, PR commands, write calls to the
+   GitHub or GitLab API, and package or image uploads.
+
+Shell commands are parsed, not pattern-matched (`scripts/shell.mjs`,
+`scripts/commands.mjs`): quotes, heredocs, `$(...)`, `sh -c`, `eval`, wrappers
+such as `env` or `sudo`, and git options and aliases are all followed. Paths are
+resolved from the command's own folder, with `..` and symlinks followed, and the
+feature worktree counts as the repository.
 
 Read-only inspection is never refused: `git status`, `git diff`, `git log`,
-`git show`, `find`, `grep`, `rg`, and test and build commands all pass through.
-A guard that blocks `git status` gets switched off, and then it protects nothing.
+`find`, `grep`, and test and build commands all pass through. A guard that blocks
+`git status` gets switched off, and then it protects nothing.
 
-If no Dex feature is active, nothing is gated. Dex does not hijack ordinary
-coding work.
+If no Dex feature is active, nothing is gated. If Dex cannot tell which gates
+apply (unreadable state, several active features with none selected, a crash in
+the guard), it refuses changes and publishing and still allows reading.
+
+**The git pre-push hook** (`scripts/pre-push.mjs`) is the backstop for
+publishing. `/dex:worktree` installs it. git runs it before any push, however the
+push was started, and it refuses a `dex/*` branch whose feature has not passed
+its gates or whose pushed commit is not exactly the approved code. It never
+overwrites an existing hook; `/dex:doctor` reports whether it is installed.
+
+**What the guard cannot stop.** Reading commands cannot catch everything. A
+script file that writes into the repository before implementation starts
+(`python tools/gen.py`) is not seen. The pre-push hook covers publishing; nothing
+covers that.
 
 Other invariants the scripts enforce, not the prompts:
 
-- Verification cannot be recorded as PASS while any command exited non-zero.
+- An approval is bound to the exact content approved. The design approval also
+  records the questions it rested on, and the structure the design; re-approving
+  the earlier document with new content makes the later one stale.
+- The code approval is bound to a git tree: the feature checkout as `git add -A`
+  would commit it, minus the feature's own documents. Staging and committing do
+  not change it; any real change does.
+- Verification and AI review results apply only to the code they checked.
+- Verification cannot be recorded as PASS while any command exited non-zero, and
+  neither verification nor review can be recorded before every checkpoint is done.
 - An AI review with BLOCKER findings cannot conclude PASS.
-- A checkpoint cannot be marked complete without a verification result.
-- The design cannot be approved before the questions; the structure cannot be
-  approved before the design.
-- Code approval is refused when there is no diff, or outside a git repository.
+- A checkpoint must be started before it is finished, and recorded checkpoints
+  cannot silently disappear.
+- Code approval is refused when there is no diff, no known base commit, or no git.
+- Secrets are scrubbed from everything Dex stores.
 - State writes are atomic (temp file, fsync, rename) and hold a per-feature lock.
 
 ## Files Dex creates in your repository
@@ -347,6 +388,11 @@ docs/dex/
 
 The event log records decisions and hashes. It never records prompts,
 credentials, or environment contents.
+
+`init` lists `.dex/` in the repository's local ignore file (`.git/info/exclude`),
+so it never shows up in `git status` and is never committed. `/dex:pr` copies
+`docs/dex/<feature-slug>/` into the worktree, so the documents travel with the
+PR. `/dex:worktree` also installs a git hook at `.git/hooks/pre-push`.
 
 ## Configuration
 
@@ -377,6 +423,38 @@ Whatever the cadence, final human code approval is mandatory while
 
 Unknown configuration fields are reported as warnings and never change behavior,
 so a typo like `requireHumanCodeReview` cannot silently switch off a gate.
+
+- `strictGates: false` lets you approve documents out of order. It never removes
+  an approval that implementation or publishing needs.
+- `requireWorktree` is read every time, so changing it affects features already
+  in progress.
+- `maxResearchWorkers` limits how many research agents run at once (1 to 24).
+  Every approved question is researched.
+- `artifactRoot` and `stateRoot` must be folders inside the repository. The config
+  file itself always stays at `.dex/config.json`.
+
+## Command-line tool
+
+Every skill works through `scripts/state.mjs`. You can run it yourself from the
+repository: `node <dex>/scripts/state.mjs <command>`. `help` lists the commands.
+
+| Command | What it does |
+| ------- | ------------ |
+| `init <slug> --title "..."` | Create a feature. |
+| `status [slug]`, `check [slug]`, `next [slug]` | The gate board, the gate report as JSON, the next command. |
+| `approve <gate> <slug>` | Record an approval. Refused when the model runs it. |
+| `transition <slug> <event>` | Log a stage event. Opens no gate. |
+| `set-slices <slug> "S1:name" ...` | Record the checkpoints. `--replace` allows dropping recorded ones before any has started. |
+| `start-slice`, `finish-slice`, `block-slice` | Move one checkpoint through its states. |
+| `verification <slug> pass\|fail\|reset` | Record test results with their exit codes. |
+| `record-review <slug> pass\|remediation-required` | Record the AI review conclusion. |
+| `record-worktree <slug> <branch> <path> --base <ref>` | Record the feature worktree and pin its base commit. |
+| `install-hook` | Install the git pre-push hook. |
+| `diff-hash [slug]` | Print the base commit and tree the code approval would cover. |
+| `record-pr <slug> --url <url>` | Record the pull request. |
+| `drift <slug> --target design\|structure --reason "..."` | Block the feature because the code contradicts a document. |
+| `unblock <slug>` | Clear drift by hand. Usually not needed: re-approving does it. |
+| `active [slug]`, `list`, `config`, `events [slug]` | Select the current feature, list features, show config, show the event log. |
 
 ## When to use Dex, and when not to
 
@@ -419,6 +497,11 @@ workflows/review.js     scope diff → parallel dimension reviews → consolidat
 Both report what they could not do. A question whose research failed is listed as
 unanswered; a review dimension that returned nothing is listed as not covered.
 Neither invents evidence to fill a gap.
+
+Research covers every approved question, including ones you add under Human
+Notes. `maxResearchWorkers` only limits how many agents run at once. The skills
+pass the plugin's paths to the workflows as arguments, because workflow agents
+cannot see the plugin folder on their own.
 
 Human approval never sits in the middle of a workflow — a workflow cannot pause
 to hold a design discussion. The state machine sequences the interactive commands

@@ -4,6 +4,64 @@ All notable changes to the Dex plugin.
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] — 2026-09-28
+
+Fixes from an adversarial review. The finding numbers refer to
+`review-findings.md` in the repository that holds this plugin.
+
+### Changed
+
+- **Only the user approves.** Approvals are recorded by a new
+  `UserPromptSubmit` hook when the user types `/dex:approve <gate> <slug>`. The
+  guard refuses the approve command from tool calls and refuses writes to `.dex/`
+  (findings 1, 2). `approve` takes `<gate> <slug>` only (finding 29).
+- **The code approval is a git tree**, built from the feature checkout minus the
+  feature's own documents. Staging and committing keep it valid; any real change
+  voids it. Publishing also requires HEAD to hold exactly that tree. The base
+  commit is pinned when implementation starts (findings 4, 5, 6).
+- **Gates re-check everything upstream.** Implementation needs current questions;
+  publishing needs everything implementation needs. Verification and AI review
+  apply only to the code they checked. Re-approving the questions makes the
+  design stale, and the design the structure (findings 8, 11, 12).
+- **Drift** takes `--target design|structure` and is cleared automatically once
+  the revised documents are approved again (finding 20).
+- **Research** covers every approved question, including Human Notes;
+  `maxResearchWorkers` limits concurrency. Probes run as the read-only
+  `research-probe` agent (findings 17, 18).
+- **`/dex:pr`** commits the feature documents with the code (Q11).
+
+### Added
+
+- `scripts/shell.mjs` and `scripts/commands.mjs`: the guard parses shell
+  commands instead of pattern-matching them (findings 13, 14, 26, 27, 41).
+- `scripts/pre-push.mjs` and `state.mjs install-hook`: a git pre-push hook that
+  gates `dex/*` pushes however they are started. `/dex:worktree` installs it.
+- `state.mjs diff-hash --json`, and warnings from `set-slices` when checkpoints
+  do not match the structure document (finding 37).
+- Tests that run the hooks as real processes, run the workflows with a fake
+  agent, and drive the whole flow end to end.
+
+### Fixed
+
+- Dex finds its state from inside a worktree (finding 3), and `.dex/` no longer
+  makes the tree look dirty (finding 10).
+- Unreadable state, a broken active marker, several active features with none
+  selected, or a guard crash now refuse changes instead of allowing everything
+  (findings 7, 19).
+- The hook matcher covers ApplyPatch, PowerShell and MCP write tools; the hooks
+  work through symlinked plugin folders (findings 15, 16).
+- Workflows receive the plugin's paths as arguments (finding 9); skills use
+  `scriptPath`, exact review dimension names, and stop on a failed workflow
+  (finding 22).
+- `requireWorktree` is read live; `record-worktree` accepts only a real linked
+  worktree (finding 23).
+- Checkpoints: no finishing without starting, no silent dropping, `S01` equals
+  `S1` (finding 21). Flags given without a value are errors.
+- Secrets are scrubbed before truncation and before anything is stored (finding
+  24). Slugs are validated before any folder is created (findings 25, 33, 34).
+- Locks survive half-written files and clock skew; `init` checks under the lock
+  (finding 28). Doctor no longer writes into the repository (findings 31, 32).
+
 ## [0.1.0] — 2026-09-27
 
 Initial release.
