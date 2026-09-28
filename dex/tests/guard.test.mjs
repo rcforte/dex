@@ -102,10 +102,10 @@ test('Write to a Dex artifact during design is ALLOWED', async () => {
   }
 })
 
-test('Write to Dex state during design is ALLOWED', async () => {
+test('finding 2: Write to Dex state during design is DENIED', async () => {
   const ctx = await ctxAt('design')
   for (const p of ['.dex/feat/state.json', '.dex/active', '.dex/config.json']) {
-    assert.equal(verdict(ctx, write(p)).decision, 'allow', p)
+    assert.equal(verdict(ctx, write(p)).decision, 'deny', p)
   }
 })
 
@@ -118,7 +118,7 @@ test('Windows-style paths are normalized before the gate check', async () => {
   assert.equal(decide({ ...write('C:\\repo\\src\\foo.java'), ...args }).decision, 'deny')
   assert.equal(decide({ ...write('C:\\repo\\src\\deep\\nested\\Bar.cs'), ...args }).decision, 'deny')
   assert.equal(decide({ ...write('C:\\repo\\docs\\dex\\feat\\04-design.md'), ...args }).decision, 'allow')
-  assert.equal(decide({ ...write('C:\\repo\\.dex\\feat\\state.json'), ...args }).decision, 'allow')
+  assert.equal(decide({ ...write('C:\\repo\\.dex\\feat\\state.json'), ...args }).decision, 'deny')
   // Drive-letter case must not defeat the relative-path check.
   assert.equal(decide({ ...write('c:\\repo\\docs\\dex\\feat\\02-questions.md'), ...args }).decision, 'allow')
 })
@@ -346,17 +346,19 @@ test('with no active Dex feature, nothing is gated', () => {
   }
 })
 
-test('with several active features and none marked, only publishing is gated', () => {
+test('finding 19: with several active features and none marked, changes and publishing are refused', () => {
   const args = { root: '/some/repo', config: CONFIG, feature: null, ambiguous: true, candidates: ['feat-a', 'feat-b'] }
-  assert.equal(decide({ ...write('src/foo.java'), ...args }).decision, 'allow')
-  assert.equal(decide({ ...bash('rm -rf src'), ...args }).decision, 'allow')
+  assert.equal(decide({ ...write('src/foo.java'), ...args }).decision, 'deny')
+  assert.equal(decide({ ...bash('rm -rf src'), ...args }).decision, 'deny')
+  assert.equal(decide({ ...bash('git status'), ...args }).decision, 'allow')
+  assert.equal(decide({ ...write('docs/dex/feat-a/04-design.md'), ...args }).decision, 'allow')
 
   const r = decide({ ...bash('git push origin HEAD'), ...args })
   assert.equal(r.decision, 'deny')
   assert.match(r.reason, /several features are active and none is marked current/)
   assert.match(r.reason, /feat-a/)
   assert.match(r.reason, /feat-b/)
-  assert.match(r.reason, /will not guess which feature's code approval applies/)
+  assert.match(r.reason, /will not guess which feature's gates apply/)
 })
 
 test('tools Dex does not gate are always allowed', () => {

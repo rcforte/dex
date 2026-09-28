@@ -25,6 +25,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import {
+  DEFAULT_CONFIG,
   findRepoRoot,
   isUnder,
   loadConfig,
@@ -219,6 +220,46 @@ function relativizeForGates(target, root, worktreePath) {
 }
 
 // ---------------------------------------------------------------------------
+// Human-only operations
+// ---------------------------------------------------------------------------
+
+/**
+ * `node .../state.mjs approve ...`, anywhere in the command, including inside
+ * `sh -c "..."`. Only the user records approvals: by typing /dex:approve, which
+ * the UserPromptSubmit hook records, or in their own terminal.
+ */
+const MODEL_APPROVE = /\bnode\b[^;&|\n]*state\.mjs['"]?\s+approve\b/
+
+/** Every redirect or tee target in a command, as written. */
+function shellWriteTargets(command, segments) {
+  const out = []
+  const re = /(?:^|\s)\d?>>?\s*("[^"]+"|'[^']+'|[^\s;|&]+)/g
+  let m
+  while ((m = re.exec(String(command || '')))) out.push(m[1].replace(/^["']|["']$/g, ''))
+  for (const seg of segments) {
+    if (!/^tee\b/.test(seg)) continue
+    for (const a of seg.split(/\s+/).slice(1)) if (!a.startsWith('-')) out.push(a.replace(/^["']|["']$/g, ''))
+  }
+  return out
+}
+
+/**
+ * Anything this call would write under the Dex state folder. The state folder
+ * holds approvals and gate state; only state.mjs may change it, and state.mjs
+ * runs as `node`, not as an edit tool or a shell redirect.
+ */
+function stateRootWrites({ isEdit, toolName, toolInput, command, segments, root, config }) {
+  const under = (p) => isUnder(normalizeRelPath(String(p).replace(/^["']|["']$/g, ''), root), config.stateRoot)
+  if (isEdit) return writeTargets(toolName, toolInput).filter(under)
+  const hits = shellWriteTargets(command, segments).filter(under)
+  for (const seg of segments) {
+    if (!MUTATION_PATTERNS.some((p) => p.re.test(seg))) continue
+    hits.push(...seg.split(/\s+/).slice(1).filter(under))
+  }
+  return hits
+}
+
+// ---------------------------------------------------------------------------
 // Decision
 // ---------------------------------------------------------------------------
 
@@ -244,7 +285,7 @@ const allow = (why) => ({ decision: ALLOW, why })
  * @param {boolean} args.ambiguous    several active features, none marked
  * @param {string[]} args.candidates
  */
-export function decide({ toolName, toolInput, root, config, feature, ambiguous = false, candidates = [] }) {
+export function decide({ toolName, toolInput, root, config, feature, ambiguous = false, candidates = [], lockdown = null }) {
   const isEdit = EDIT_TOOLS.has(toolName)
   const isShell = SHELL_TOOLS.has(toolName)
   if (!isEdit && !isShell) return allow('tool is not gated by Dex')
@@ -253,19 +294,33 @@ export function decide({ toolName, toolInput, root, config, feature, ambiguous =
   const segments = isShell ? splitSegments(command) : []
   const publishHit = segments.map((s) => PUBLISH_PATTERNS.find((p) => p.re.test(s))).find(Boolean)
 
-  // Several active features and none marked current: do not guess which gates
-  // apply. Ordinary work proceeds; the irreversible step does not.
-  if (ambiguous) {
-    if (publishHit) {
-      return denial(
-        `Dex blocked ${publishHit.what} because several features are active and none is marked current:\n` +
-          candidates.map((c) => `  - ${c}`).join('\n') +
-          `\n\nDex will not guess which feature's code approval applies to this push.\n\n` +
-          `Select one:\n  /dex:resume <feature>`
-      )
-    }
-    return allow('several active features; only publish operations are gated')
+  // --- Human-only operations: refused in every phase, with or without a feature
+  if (isShell && MODEL_APPROVE.test(command)) {
+    return denial(
+      `Dex refused to record an approval from a tool call. Only the user approves.\n\n` +
+        `Ask the user to type:\n  /dex:approve <gate> <feature-slug>\n\n` +
+        `or to run the approve command in their own terminal. Do not try another way.`
+    )
   }
+  const stateHits = stateRootWrites({ isEdit, toolName, toolInput, command, segments, root, config })
+  if (stateHits.length) {
+    return denial(
+      `Dex refused a write to its state folder (${config.stateRoot}/). That folder holds approvals and gate state, ` +
+        `and only Dex's own state.mjs commands may change it.\n\n` +
+        `Target(s):\n${stateHits.map((t) => `  - ${t}`).join('\n')}\n\n` +
+        `Use the matching /dex:* command instead. If the state looks wrong, run /dex:status and tell the user.`
+    )
+  }
+
+  // Several active features and none marked current, or state Dex cannot read:
+  // Dex cannot tell which gates apply, so it refuses changes rather than guess.
+  if (ambiguous && !lockdown) {
+    lockdown =
+      `several features are active and none is marked current:\n` +
+      candidates.map((c) => `  - ${c}`).join('\n') +
+      `\n\nDex will not guess which feature's gates apply.\n\nSelect one:\n  /dex:resume <feature>`
+  }
+  if (lockdown) return lockedDecision({ isEdit, toolName, toolInput, command, segments, publishHit, root, config, lockdown })
 
   if (!feature) return allow('no active Dex feature; Dex does not gate ordinary work')
 
@@ -359,6 +414,29 @@ export function decide({ toolName, toolInput, root, config, feature, ambiguous =
   return allow('no repository mutation detected')
 }
 
+/**
+ * The decision when Dex cannot tell which gates apply: reading and ordinary
+ * inspection pass; changes and publishing are refused until the state is fixed.
+ */
+function lockedDecision({ isEdit, toolName, toolInput, command, segments, publishHit, root, config, lockdown }) {
+  const refuse = (what) =>
+    denial(
+      `Dex refused ${what} because ${lockdown}\n\n` +
+        `Reading and inspecting are still allowed. Run /dex:doctor or /dex:status, and tell the user what is wrong.`
+    )
+  if (publishHit) return refuse(publishHit.what)
+  if (isEdit) {
+    const targets = writeTargets(toolName, toolInput).filter((t) => !isUnder(normalizeRelPath(t, root), config.artifactRoot))
+    return targets.length ? refuse(`a write to ${targets.join(', ')}`) : allow('writing Dex artifacts')
+  }
+  const hit = segments.map((seg) => MUTATION_PATTERNS.find((p) => p.re.test(seg))).find(Boolean)
+  if (hit) return refuse(hit.what)
+  const ctx = { root, artifactRoot: config.artifactRoot, stateRoot: config.stateRoot }
+  const writes = [...unsafeRedirectTargets(command, ctx), ...unsafeTeeTargets(segments, ctx)]
+  if (writes.length) return refuse(`a shell write to ${writes.join(', ')}`)
+  return allow('no repository mutation detected')
+}
+
 // ---------------------------------------------------------------------------
 // Hook plumbing
 // ---------------------------------------------------------------------------
@@ -371,27 +449,80 @@ function readStdin() {
   }
 }
 
+function realpathOr(p) {
+  try {
+    return fs.realpathSync(p)
+  } catch {
+    return path.resolve(p)
+  }
+}
+
+/** The feature whose recorded worktree contains any of these paths, if one does. */
+function featureByWorktree(features, paths) {
+  for (const f of features) {
+    const wt = f.state.worktree?.path
+    if (!wt || !fs.existsSync(wt)) continue
+    const base = realpathOr(wt)
+    for (const p of paths) {
+      const abs = realpathOr(p)
+      if (abs === base || abs.startsWith(base + path.sep)) return f
+    }
+  }
+  return null
+}
+
 /** Build the decision inputs from a raw PreToolUse payload. */
 export function evaluateHookInput(payload, { cwd = process.cwd() } = {}) {
   const toolName = payload?.tool_name ?? payload?.toolName ?? ''
   const toolInput = payload?.tool_input ?? payload?.toolInput ?? {}
   const startDir = payload?.cwd || cwd
   const root = findRepoRoot(startDir)
-  const config = loadConfig(root)
+  const base = { toolName, toolInput, root }
+
+  let config
+  try {
+    config = loadConfig(root)
+  } catch (err) {
+    return decide({ ...base, config: DEFAULT_CONFIG, feature: null, lockdown: `Dex could not read its config.\n\n${firstLine(err)}` })
+  }
   const resolved = resolveActiveFeature(root, config)
-  let feature = null
-  if (resolved.slug && resolved.state) {
-    feature = { slug: resolved.slug, state: resolved.state, gates: computeGates(root, config, resolved.state) }
+  const gatesFor = (f) => ({ slug: f.slug, state: f.state, gates: computeGates(root, config, f.state) })
+
+  if (resolved.unreadable.length) {
+    return decide({
+      ...base,
+      config,
+      feature: null,
+      lockdown:
+        `Dex could not read the state of: ${resolved.unreadable.map((u) => `${u.slug} (${u.error})`).join(', ')}.\n\n` +
+        `Until that state is fixed, Dex cannot tell which gates apply.`,
+    })
+  }
+
+  // A call that touches a feature's worktree is checked against that feature.
+  const touched = [startDir, ...writeTargets(toolName, toolInput).map((t) => path.resolve(startDir, t))]
+  const owner = featureByWorktree(resolved.features, touched)
+  if (owner) return decide({ ...base, config, feature: gatesFor(owner) })
+
+  if (resolved.brokenMarker) {
+    return decide({
+      ...base,
+      config,
+      feature: null,
+      lockdown: `${config.stateRoot}/active names the feature "${resolved.brokenMarker}", which does not exist. Select a real feature with /dex:resume <feature>.`,
+    })
   }
   return decide({
-    toolName,
-    toolInput,
-    root,
+    ...base,
     config,
-    feature,
+    feature: resolved.slug && resolved.state ? gatesFor(resolved) : null,
     ambiguous: resolved.ambiguous,
     candidates: resolved.candidates,
   })
+}
+
+function firstLine(err) {
+  return String(err?.message ?? err).split('\n')[0]
 }
 
 function emitDeny(reason) {
@@ -422,20 +553,21 @@ if (isMain) {
     if (result.decision === DENY) emitDeny(result.reason)
     process.exit(0)
   } catch (err) {
-    // The guard itself failed. Ordinary work continues, but the irreversible
-    // step is still refused, so a crash can never open the PR gate.
-    const toolName = payload?.tool_name ?? ''
-    const command = String(payload?.tool_input?.command ?? '')
-    const publishing = splitSegments(command).some((s) => PUBLISH_PATTERNS.some((p) => p.re.test(s)))
-    if (publishing) {
-      emitDeny(
-        `Dex could not evaluate its gates, so it refused a publish operation rather than risk pushing unreviewed code.\n\n` +
-          `Error: ${err.message}\n\n` +
-          `Diagnose with:\n  /dex:doctor`
-      )
-      process.exit(0)
+    // The guard itself failed. Dex cannot tell which gates apply, so it refuses
+    // changes and publishing, and lets reading continue.
+    try {
+      const result = decide({
+        toolName: payload?.tool_name ?? '',
+        toolInput: payload?.tool_input ?? {},
+        root: payload?.cwd || process.cwd(),
+        config: DEFAULT_CONFIG,
+        feature: null,
+        lockdown: `Dex's guard failed: ${firstLine(err)}. Diagnose with /dex:doctor.`,
+      })
+      if (result.decision === DENY) emitDeny(result.reason)
+    } catch {
+      emitDeny(`Dex's guard failed and could not evaluate this call: ${firstLine(err)}. Diagnose with /dex:doctor.`)
     }
-    process.stderr.write(`dex guard: ${err.message} (allowing ${toolName || 'tool call'})\n`)
     process.exit(0)
   }
 }

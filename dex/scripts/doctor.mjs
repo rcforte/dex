@@ -135,13 +135,16 @@ export async function runDoctor({ cwd = process.cwd() } = {}) {
       const hooks = JSON.parse(fs.readFileSync(hooksPath, 'utf8'))
       const pre = hooks?.hooks?.PreToolUse
       add('Hooks', Array.isArray(pre) && pre.length ? PASS : FAIL, Array.isArray(pre) && pre.length ? `PreToolUse guard registered (${pre[0].matcher})` : 'no PreToolUse entry')
+      const prompt = (hooks?.hooks?.UserPromptSubmit || []).flatMap((h) => h.hooks || [])
+      const approveHook = prompt.some((h) => String(h.command).includes('approve-hook.mjs'))
+      add('Hooks', approveHook ? PASS : FAIL, approveHook ? 'UserPromptSubmit approval hook registered' : 'no UserPromptSubmit approval hook — /dex:approve cannot record approvals')
     } catch (err) {
       add('Hooks', FAIL, `hooks.json invalid: ${err.message}`)
     }
   }
 
   const selfFile = path.basename(fileURLToPath(import.meta.url))
-  for (const script of ['lib.mjs', 'state.mjs', 'guard.mjs', 'doctor.mjs', 'status.mjs']) {
+  for (const script of ['lib.mjs', 'state.mjs', 'guard.mjs', 'approve-hook.mjs', 'doctor.mjs', 'status.mjs']) {
     const abs = path.join(PLUGIN_ROOT, 'scripts', script)
     if (!fs.existsSync(abs)) {
       add(`Script ${script}`, FAIL, 'missing')

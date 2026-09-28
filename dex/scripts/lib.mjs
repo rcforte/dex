@@ -260,8 +260,10 @@ export function readJson(absPath, fallback = undefined) {
   try {
     return JSON.parse(fs.readFileSync(absPath, 'utf8'))
   } catch (err) {
-    if (err && err.code === 'ENOENT') return fallback
-    if (fallback !== undefined) return fallback
+    // Only a missing file falls back. A file that exists but does not parse is
+    // an error: silently treating it as absent makes a feature disappear, and
+    // the guard would then stop gating it.
+    if (err && err.code === 'ENOENT' && fallback !== undefined) return fallback
     throw new DexError(
       `Dex could not read JSON at ${absPath}\n\n${err.message}\n\n` +
         `The file is present but not valid JSON. Inspect it, or delete it to start that piece of state over.`
@@ -414,7 +416,12 @@ export function withFeatureLock(root, config, slug, fn) {
       break
     } catch (err) {
       if (err.code !== 'EEXIST') throw err
-      const info = readJson(lockPath, null)
+      let info = null
+      try {
+        info = readJson(lockPath, null)
+      } catch {
+        // A half-written lock reads as garbage; the age check below treats it as stale.
+      }
       const age = info && info.acquiredAt ? Date.now() - Date.parse(info.acquiredAt) : Infinity
       if (!Number.isFinite(age) || age > LOCK_STALE_MS) {
         try {
@@ -442,7 +449,11 @@ export function withFeatureLock(root, config, slug, fn) {
     // A lock we cannot annotate still excludes other writers.
   }
   try {
-    return fn({ reclaimed })
+    const result = fn({ reclaimed })
+    // The feature a command just changed is the one being worked on, so the
+    // guard should check that feature's gates from now on.
+    if (fs.existsSync(featureStatePath(root, config, slug))) writeActiveSlug(root, config, slug)
+    return result
   } finally {
     try {
       fs.closeSync(fd)
@@ -629,23 +640,43 @@ export function saveFeatureState(root, config, slug, state) {
 }
 
 export function listFeatures(root, config) {
+  return scanFeatures(root, config).features
+}
+
+/**
+ * Every feature folder under the state root, split into the ones Dex can read
+ * and the ones it cannot (state.json present but unparseable or malformed).
+ * Unreadable features must not be skipped silently by anything that gates.
+ */
+export function scanFeatures(root, config) {
   const dir = stateRootDir(root, config)
   let entries = []
   try {
     entries = fs.readdirSync(dir, { withFileTypes: true })
   } catch {
-    return []
+    return { features: [], unreadable: [] }
   }
-  const out = []
+  const features = []
+  const unreadable = []
   for (const e of entries) {
     if (!e.isDirectory()) continue
     const statePath = path.join(dir, e.name, 'state.json')
-    const state = readJson(statePath, null)
-    if (!state || !state.feature) continue
-    out.push({ slug: state.feature.slug || e.name, title: state.feature.title, phase: state.phase, state })
+    if (!fs.existsSync(statePath)) continue
+    let state
+    try {
+      state = readJson(statePath)
+    } catch (err) {
+      unreadable.push({ slug: e.name, error: err.message.split('\n')[0] })
+      continue
+    }
+    if (!state || typeof state !== 'object' || !state.feature || !state.approvals) {
+      unreadable.push({ slug: e.name, error: 'state.json is missing required fields' })
+      continue
+    }
+    features.push({ slug: state.feature.slug || e.name, title: state.feature.title, phase: state.phase, state })
   }
-  out.sort((a, b) => String(a.slug).localeCompare(String(b.slug)))
-  return out
+  features.sort((a, b) => String(a.slug).localeCompare(String(b.slug)))
+  return { features, unreadable }
 }
 
 export function readActiveSlug(root, config) {
@@ -670,19 +701,24 @@ export function writeActiveSlug(root, config, slug) {
  */
 export function resolveActiveFeature(root, config) {
   const marked = readActiveSlug(root, config)
-  const features = listFeatures(root, config)
+  const { features, unreadable } = scanFeatures(root, config)
   const active = features.filter((f) => isActivePhase(f.phase))
+  const base = { unreadable, brokenMarker: null, features }
   if (marked) {
     const hit = features.find((f) => f.slug === marked)
-    if (hit) return { slug: hit.slug, state: hit.state, ambiguous: false, candidates: active.map((f) => f.slug) }
+    if (hit) return { ...base, slug: hit.slug, state: hit.state, ambiguous: false, candidates: active.map((f) => f.slug) }
+    // A marker naming a feature that does not exist, while features do exist,
+    // means Dex cannot tell which gates apply. Callers must not guess.
+    if (features.length || unreadable.length) base.brokenMarker = marked
   }
+  if (base.brokenMarker) return { ...base, slug: null, state: null, ambiguous: false, candidates: active.map((f) => f.slug) }
   if (active.length === 1) {
-    return { slug: active[0].slug, state: active[0].state, ambiguous: false, candidates: [active[0].slug] }
+    return { ...base, slug: active[0].slug, state: active[0].state, ambiguous: false, candidates: [active[0].slug] }
   }
   if (active.length === 0) {
-    return { slug: null, state: null, ambiguous: false, candidates: [] }
+    return { ...base, slug: null, state: null, ambiguous: false, candidates: [] }
   }
-  return { slug: null, state: null, ambiguous: true, candidates: active.map((f) => f.slug) }
+  return { ...base, slug: null, state: null, ambiguous: true, candidates: active.map((f) => f.slug) }
 }
 
 // ---------------------------------------------------------------------------

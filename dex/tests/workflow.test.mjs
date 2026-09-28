@@ -287,7 +287,7 @@ test('skills call the state script rather than editing state as prose', () => {
 })
 
 test('the approve skill forbids hand-editing state', () => {
-  assert.match(skillProse('approve'), /Do not update state by writing JSON yourself/)
+  assert.match(skillProse('approve'), /Never try to approve another way, for example by editing state files/)
 })
 
 test('no skill claims that AI review or plan review replaces reading the code', () => {
