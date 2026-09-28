@@ -183,3 +183,15 @@ test('finding 32: doctor reports a feature it cannot read, and fails', async () 
   assert.match(line.detail, /feat/)
   assert.match(line.detail, /cannot be read|could not read/i)
 })
+
+// ---------------------------------------------------------------------------
+// The config file has one home (finding 38)
+// ---------------------------------------------------------------------------
+
+test('finding 38: with a custom stateRoot, the config stays in .dex/config.json', async () => {
+  const root = makeRepo()
+  write(root, '.dex/config.json', JSON.stringify({ schemaVersion: 1, stateRoot: '.dex-state' }))
+  await state(root, ['init', 'feat', '--title', 'Feat'])
+  assert.ok(fs.existsSync(path.join(root, '.dex-state/feat/state.json')))
+  assert.equal(fs.existsSync(path.join(root, '.dex-state/config.json')), false, 'no second config file')
+})

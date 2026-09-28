@@ -403,8 +403,14 @@ export function loadConfig(root, { stateRoot = '.dex' } = {}) {
 }
 
 /** Write .dex/config.json only when it is absent. Never clobber operator choices. */
-export function ensureConfig(root, stateRoot = '.dex') {
-  const configPath = path.join(root, stateRoot, 'config.json')
+/**
+ * Create .dex/config.json with the defaults if it does not exist.
+ *
+ * The config always lives in .dex/, whatever stateRoot says: stateRoot is read
+ * from this file, so the file cannot live inside the folder it names.
+ */
+export function ensureConfig(root) {
+  const configPath = path.join(root, '.dex', 'config.json')
   if (fs.existsSync(configPath)) return { created: false, path: configPath }
   writeJsonAtomic(configPath, DEFAULT_CONFIG)
   return { created: true, path: configPath }

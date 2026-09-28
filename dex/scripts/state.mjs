@@ -619,7 +619,7 @@ COMMANDS.init = (ctx, argv) => {
     throw new DexError(`"${slug}" is reserved: it is the name of an approval gate. Choose another feature name.`)
   }
   const { root, config } = ctx
-  ensureConfig(root, config.stateRoot)
+  ensureConfig(root)
   ignoreStateRoot(root, config)
   const statePath = path.join(featureStateDir(root, config, slug), 'state.json')
   // Check and create under the lock, so two init commands cannot both create it.
