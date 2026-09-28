@@ -29,6 +29,7 @@
  *   node state.mjs list
  *   node state.mjs config
  *   node state.mjs diff-hash [<slug>]      print the tree the code approval would cover
+ *   node state.mjs stage-workflow <research|review>   copy a workflow into the project so the Workflow tool can load it
  */
 
 import fs from 'node:fs'
@@ -52,6 +53,7 @@ import {
   git,
   ignoreStateRoot,
   installPrePushHook,
+  stageWorkflow,
   isGitRepo,
   listFeatures,
   loadConfig,
@@ -1493,6 +1495,14 @@ COMMANDS['diff-hash'] = (ctx, argv) => {
     text: `dir:    ${dir}\nbase:   ${baseSha ?? '(not pinned)'}\ntree:   ${tree ?? '(none)'}` + (baseSha && tree ? `\n\nRead it:\n  git -C ${dir} diff ${baseSha} ${tree}` : ''),
     json,
   }
+}
+
+COMMANDS['stage-workflow'] = (ctx, argv) => {
+  const { flags, rest } = parseFlags(argv)
+  const name = rest[0]
+  const { path: staged } = stageWorkflow(ctx.root, ctx.config, name, { cwd: ctx.cwd })
+  const json = { name, path: staged }
+  return { text: flags.json ? JSON.stringify(json) : staged, json }
 }
 
 COMMANDS['install-hook'] = (ctx) => {

@@ -46,10 +46,18 @@ Get the exact diff the human will approve:
 node "${CLAUDE_PLUGIN_ROOT}/scripts/state.mjs" diff-hash <slug> --json
 ```
 
-It prints `dir`, `baseSha` and `tree`. Then:
+It prints `dir`, `baseSha` and `tree`. The Workflow tool only loads scripts from
+inside the project, so copy the workflow in:
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/state.mjs" stage-workflow review
+```
+
+It prints the path of the copy. If it fails, stop and tell the user its message.
+Then:
 
 ```text
-Workflow tool, scriptPath: ${CLAUDE_PLUGIN_ROOT}/workflows/review.js
+Workflow tool, scriptPath: <the path stage-workflow printed>
 args: {
   "slug": "<slug>",
   "dimensions": ["correctness", "design-conformance", "test-adequacy"],
@@ -65,6 +73,10 @@ args: {
 ```
 
 Pass `args` as a real JSON object.
+
+If the Workflow tool refuses to start the script, stop and tell the user its
+message, and suggest `/dex:doctor`. Do not fall back to subagents and do not paste
+the script inline.
 
 **When the result arrives:**
 

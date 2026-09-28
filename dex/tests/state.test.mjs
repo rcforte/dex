@@ -16,6 +16,7 @@ import {
   exists,
   gitIn,
   makeRepo,
+  PLUGIN_ROOT,
   read,
   readState,
   state,
@@ -798,4 +799,76 @@ test('a recorded verification command reaches the event log already scrubbed', a
   const log = read(root, '.dex/feat/events.jsonl')
   assert.doesNotMatch(log, /ghp_ABCDEFGH/)
   assert.match(log, /\[redacted\]/)
+})
+
+// ---------------------------------------------------------------------------
+// Staging workflows
+// ---------------------------------------------------------------------------
+
+const pluginWorkflow = (name) => fs.readFileSync(path.join(PLUGIN_ROOT, 'workflows', `${name}.js`))
+
+for (const name of ['research', 'review']) {
+  test(`stage-workflow ${name} copies the plugin file into the project's state folder`, async () => {
+    const root = makeRepo()
+    const staged = path.join(root, '.dex', '_workflows', `${name}.js`)
+    const r = await state(root, ['stage-workflow', name])
+    assert.equal(r.text, staged)
+    assert.deepEqual(r.json, { name, path: staged })
+    assert.ok(fs.readFileSync(staged).equals(pluginWorkflow(name)))
+  })
+}
+
+test('stage-workflow overwrites a copy that was changed by hand', async () => {
+  const root = makeRepo()
+  await state(root, ['stage-workflow', 'research'])
+  write(root, '.dex/_workflows/research.js', 'junk')
+  await state(root, ['stage-workflow', 'research'])
+  assert.ok(fs.readFileSync(path.join(root, '.dex', '_workflows', 'research.js')).equals(pluginWorkflow('research')))
+})
+
+test('stage-workflow follows a custom stateRoot', async () => {
+  const root = makeRepo()
+  write(root, '.dex/config.json', JSON.stringify({ stateRoot: 'state' }))
+  const r = await state(root, ['stage-workflow', 'research'])
+  assert.equal(r.text, path.join(root, 'state', '_workflows', 'research.js'))
+  assert.ok(exists(root, 'state/_workflows/research.js'))
+})
+
+test('stage-workflow refuses an unknown workflow and names the real ones', async () => {
+  const root = makeRepo()
+  const msg = await stateFails(root, ['stage-workflow', 'bogus'])
+  assert.match(msg, /research/)
+  assert.match(msg, /review/)
+  assert.equal(exists(root, '.dex/_workflows'), false)
+})
+
+test('the staged workflows folder is not reported as a feature', async () => {
+  const root = makeRepo()
+  await state(root, ['init', 'feat'])
+  await state(root, ['stage-workflow', 'research'])
+  const r = await state(root, ['list'])
+  assert.doesNotMatch(r.text, /_workflows/)
+})
+
+test('staging in a repository where Dex was never initialised leaves git status clean', async () => {
+  const root = makeRepo()
+  await state(root, ['stage-workflow', 'research'])
+  assert.equal(gitIn(root, ['status', '--porcelain']).trim(), '')
+})
+
+test('from a linked worktree, stage-workflow copies into that worktree and reads state from the main checkout', async () => {
+  const root = makeRepo()
+  await state(root, ['init', 'feat'])
+  const wt = fs.mkdtempSync(path.join(path.dirname(root), 'dex-wt-'))
+  fs.rmdirSync(wt)
+  gitIn(root, ['worktree', 'add', '-q', wt, '-b', 'wt-branch'])
+  try {
+    const r = await state(wt, ['stage-workflow', 'research'])
+    assert.equal(r.text, path.join(wt, '.dex', '_workflows', 'research.js'))
+    assert.ok(fs.readFileSync(r.text).equals(pluginWorkflow('research')))
+    assert.equal(gitIn(wt, ['status', '--porcelain']).trim(), '')
+    assert.match((await state(wt, ['list'])).text, /feat/)
+  } finally {
+    gitIn(root, ['worktree', 'remove', '--force', wt])
+  }
 })

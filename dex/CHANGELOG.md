@@ -4,6 +4,20 @@ All notable changes to the Dex plugin.
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] — 2026-09-28
+
+### Fixed
+
+- **`/dex:research` and `/dex:review` start in any project.** The Workflow tool
+  only loads scripts from inside the project, and the plugin folder is outside it.
+  The skills now run `state.mjs stage-workflow <name>`, which copies the workflow
+  to `.dex/_workflows/<name>.js`, and launch that copy. It is refreshed on every
+  launch, so the plugin file stays the only source.
+- **`/dex:doctor` checks that the workflows can be staged.** It makes the copies
+  for real and fails if it cannot. Doctor now writes `.dex/_workflows/` into the
+  repository it inspects. Like `stage-workflow`, it may also add the `/.dex/` line
+  to `.git/info/exclude` so the copies stay out of `git status`.
+
 ## [0.2.0] — 2026-09-28
 
 Fixes from an adversarial review. The finding numbers refer to

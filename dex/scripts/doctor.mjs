@@ -22,6 +22,9 @@ import {
   loadConfig,
   normalizeRelPath,
   pad,
+  sessionTop,
+  stageWorkflow,
+  WORKFLOW_NAMES,
 } from './lib.mjs'
 
 const PLUGIN_ROOT = process.env.CLAUDE_PLUGIN_ROOT
@@ -172,9 +175,9 @@ export async function runDoctor({ cwd = process.cwd() } = {}) {
     }
   }
 
-  for (const wf of ['research.js', 'review.js']) {
-    const r = await checkWorkflow(wf)
-    add(`Workflow ${wf}`, r.status, r.detail)
+  for (const name of WORKFLOW_NAMES) {
+    const r = await checkWorkflow(`${name}.js`)
+    add(`Workflow ${name}.js`, r.status, r.detail)
   }
 
   const templateFiles = [
@@ -214,6 +217,22 @@ export async function runDoctor({ cwd = process.cwd() } = {}) {
   add('State root writable', writableDir(stateRoot) ? PASS : FAIL, stateRoot)
   const artifactRoot = path.join(root, config.artifactRoot)
   add('Artifact root writable', writableDir(artifactRoot) ? PASS : FAIL, artifactRoot)
+
+  // The Workflow tool only loads scripts from inside the project, so skills
+  // launch a staged copy. Stage for real: a folder that looks writable can
+  // still refuse the copy. Compare real paths, so a symlinked state folder
+  // that points outside the checkout is caught.
+  const top = sessionTop(cwd, root)
+  for (const name of WORKFLOW_NAMES) {
+    try {
+      const { path: staged } = stageWorkflow(root, config, name, { cwd })
+      const rel = path.relative(fs.realpathSync(top), fs.realpathSync(staged))
+      const inside = rel !== '' && rel !== '..' && !rel.startsWith('..' + path.sep) && !path.isAbsolute(rel)
+      add(`Workflow ${name} staging`, inside ? PASS : FAIL, inside ? rel : `${staged} is outside ${top} — the Workflow tool would refuse it`)
+    } catch (err) {
+      add(`Workflow ${name} staging`, FAIL, err.message.split('\n')[0])
+    }
+  }
 
   try {
     const { features, unreadable } = scanFeatures(root, config)

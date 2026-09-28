@@ -25,10 +25,18 @@ this stage is built around.
 
 ## 2. Run the research workflow
 
-The orchestration lives in a workflow script, not in this prompt:
+The orchestration lives in a workflow script, not in this prompt. The Workflow
+tool only loads scripts from inside the project, so copy it in first:
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/state.mjs" stage-workflow research
+```
+
+It prints the path of the copy. If it fails, stop and tell the user its message.
+Then:
 
 ```text
-Workflow tool, scriptPath: ${CLAUDE_PLUGIN_ROOT}/workflows/research.js
+Workflow tool, scriptPath: <the path stage-workflow printed>
 args: {
   "slug": "<slug>",
   "maxWorkers": <config.maxResearchWorkers>,
@@ -41,6 +49,10 @@ args: {
 
 Pass `args` as a real JSON object, not a string. The paths must be passed in:
 the workflow's agents cannot see the plugin folder on their own.
+
+If the Workflow tool refuses to start the script, stop and tell the user its
+message, and suggest `/dex:doctor`. Do not fall back to subagents and do not paste
+the script inline.
 
 The workflow parses the questions, including any the human added under Human
 Notes, fans out one isolated probe per question (at most `maxWorkers` at a time),

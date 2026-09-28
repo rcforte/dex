@@ -73,6 +73,8 @@ When a check passes, replace `[ ]` with `[x]` and add the date. When a check fai
   - Throwaway feature `farewell-function`: approved the questions, then Claude added a question. Status showed STALE ("questions changed after approval"). `/dex:research` stopped at its first step; no workflow ran and no `03-research.md` exists. The workflow's own gate check was not reached, so it is still untested live.
 - [x] 2026-09-28. `/dex:pr` pushes the branch with the documents included. `git -C ~/dev/code/dex-sample-origin.git ls-tree -r dex/<slug> --name-only` lists `docs/dex/<slug>/01-intent.md`.
   - All 9 documents are on origin. Copying them in and committing did not make the code approval stale. No `gh pr create`, since origin is a local bare repo; `record-pr` without `--url` marked the feature complete.
+- [ ] `/dex:research` and `/dex:review` start their workflows with no path error and no hand workaround. `/dex:doctor` shows `Workflow research staging` and `Workflow review staging` as PASS, and `git status` stays clean.
+- [ ] Open a Claude Code session in a subfolder of the sample project (for example `src/`) and run `/dex:doctor`, then `/dex:research` on a feature with approved questions. Record whether the Workflow tool accepts the copy at the repository's top-level `.dex/_workflows/`. If it refuses, doctor must be changed to catch it (AI review of `workflow-launch`, M1).
 
 ## Release check
 

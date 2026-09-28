@@ -913,6 +913,50 @@ export function headTree(dir, config, slug, rev = 'HEAD') {
 }
 
 // ---------------------------------------------------------------------------
+// Staged workflows
+// ---------------------------------------------------------------------------
+
+/** The workflows a skill may launch. */
+export const WORKFLOW_NAMES = ['research', 'review']
+export const WORKFLOWS_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'workflows')
+
+/**
+ * The top folder of the checkout a session runs in. Unlike `findRepoRoot`, a
+ * linked worktree answers with itself: that is the folder Claude Code treats as
+ * the project. Outside git, the Dex root.
+ */
+export function sessionTop(cwd, root) {
+  if (!cwd) return root
+  const top = git(['rev-parse', '--show-toplevel'], { cwd, allowFail: true })?.trim()
+  return top || root
+}
+
+/**
+ * Copy a workflow from the plugin into `<stateRoot>/_workflows/` of the session's
+ * checkout and return the copy's absolute path. The Workflow tool only loads
+ * scripts from inside the project, and the plugin folder is outside it
+ * everywhere but Dex's own repo. From a linked worktree the main checkout is
+ * outside it too, so the copy goes where the session runs, not where state lives.
+ *
+ * The copy is overwritten every time, so the plugin file stays the only source.
+ * Feature names cannot start with `_`, so the folder never clashes with one.
+ */
+export function stageWorkflow(root, config, name, { cwd } = {}) {
+  if (!WORKFLOW_NAMES.includes(name)) {
+    throw new DexError(`"${String(name).slice(0, 80)}" is not a Dex workflow.\n\nValid workflows:\n  ${WORKFLOW_NAMES.join('\n  ')}`)
+  }
+  const dest = path.join(sessionTop(cwd, root), config.stateRoot, '_workflows', `${name}.js`)
+  try {
+    fs.mkdirSync(path.dirname(dest), { recursive: true })
+    fs.copyFileSync(path.join(WORKFLOWS_DIR, `${name}.js`), dest)
+  } catch (err) {
+    throw new DexError(`Dex could not copy the ${name} workflow to ${dest}: ${err.message}\n\nCheck that ${config.stateRoot}/ is a writable folder.`)
+  }
+  ignoreStateRoot(root, config)
+  return { path: dest }
+}
+
+// ---------------------------------------------------------------------------
 // The git pre-push hook
 // ---------------------------------------------------------------------------
 

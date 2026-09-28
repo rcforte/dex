@@ -3,7 +3,7 @@
  *
  * Secrets never reach disk, slugs are checked before anything is touched,
  * `approve` takes one argument order, locks survive half-written files and
- * clock skew, and doctor looks without writing.
+ * clock skew, and doctor writes nothing but its staged workflow copies.
  */
 
 import test from 'node:test'
@@ -12,7 +12,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
 
-import { advanceTo, cleanupRepos, makeRepo, read, state, stateFails, STATE_CLI, write } from './helpers.mjs'
+import { advanceTo, cleanupRepos, gitIn, makeRepo, read, state, stateFails, STATE_CLI, write } from './helpers.mjs'
 import { runDoctor } from '../scripts/doctor.mjs'
 
 test.after(cleanupRepos)
@@ -166,11 +166,68 @@ test('finding 28: two init commands at once create the feature exactly once', as
 // Doctor (findings 31, 32)
 // ---------------------------------------------------------------------------
 
-test('finding 31: doctor writes nothing into the repository', async () => {
+test('finding 31: doctor writes only its staged workflow copies into the repository', async () => {
   const root = makeRepo()
   await runDoctor({ cwd: root })
-  assert.equal(fs.existsSync(path.join(root, '.dex')), false)
+  assert.deepEqual(fs.readdirSync(path.join(root, '.dex')), ['_workflows'])
+  assert.deepEqual(fs.readdirSync(path.join(root, '.dex', '_workflows')).sort(), ['research.js', 'review.js'])
   assert.equal(fs.existsSync(path.join(root, 'docs')), false)
+  assert.equal(gitIn(root, ['status', '--porcelain']).trim(), '')
+})
+
+test('doctor passes the workflow staging checks in a normal repository', async () => {
+  const root = makeRepo()
+  const result = await runDoctor({ cwd: root })
+  for (const name of ['research', 'review']) {
+    const line = result.checks.find((c) => c.name === `Workflow ${name} staging`)
+    assert.equal(line.status, 'PASS', `${name}: ${line.detail}`)
+  }
+})
+
+test('doctor stages into the linked worktree it runs from, and passes', async () => {
+  const root = makeRepo()
+  const wt = fs.mkdtempSync(path.join(path.dirname(root), 'dex-wt-'))
+  fs.rmdirSync(wt)
+  gitIn(root, ['worktree', 'add', '-q', wt, '-b', 'wt-branch'])
+  try {
+    const result = await runDoctor({ cwd: wt })
+    for (const name of ['research', 'review']) {
+      const line = result.checks.find((c) => c.name === `Workflow ${name} staging`)
+      assert.equal(line.status, 'PASS', `${name}: ${line.detail}`)
+      assert.ok(fs.existsSync(path.join(wt, '.dex', '_workflows', `${name}.js`)), name)
+    }
+  } finally {
+    gitIn(root, ['worktree', 'remove', '--force', wt])
+  }
+})
+
+test('doctor fails when the state folder is a symlink to somewhere outside the checkout', async () => {
+  const root = makeRepo()
+  const outside = fs.mkdtempSync(path.join(path.dirname(root), 'dex-outside-'))
+  fs.symlinkSync(outside, path.join(root, '.dex'))
+  try {
+    const result = await runDoctor({ cwd: root })
+    assert.equal(result.ok, false)
+    for (const name of ['research', 'review']) {
+      const line = result.checks.find((c) => c.name === `Workflow ${name} staging`)
+      assert.equal(line.status, 'FAIL', `${name}: ${line.detail}`)
+      assert.match(line.detail, /outside/)
+    }
+  } finally {
+    fs.rmSync(outside, { recursive: true, force: true })
+  }
+})
+
+test('doctor fails when the workflows cannot be staged', async () => {
+  const root = makeRepo()
+  write(root, '.dex', 'not a folder')
+  const result = await runDoctor({ cwd: root })
+  assert.equal(result.ok, false)
+  for (const name of ['research', 'review']) {
+    const line = result.checks.find((c) => c.name === `Workflow ${name} staging`)
+    assert.equal(line.status, 'FAIL', name)
+    assert.match(line.detail, /could not copy/)
+  }
 })
 
 test('finding 32: doctor reports a feature it cannot read, and fails', async () => {

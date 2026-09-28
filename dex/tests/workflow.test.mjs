@@ -15,10 +15,11 @@ import fs from 'node:fs'
 import path from 'node:path'
 
 import { PLUGIN_ROOT } from './helpers.mjs'
+import { WORKFLOW_NAMES } from '../scripts/lib.mjs'
 
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor
 
-const WORKFLOWS = ['research.js', 'review.js']
+const WORKFLOWS = WORKFLOW_NAMES.map((name) => `${name}.js`)
 
 function workflowSource(file) {
   return fs.readFileSync(path.join(PLUGIN_ROOT, 'workflows', file), 'utf8')

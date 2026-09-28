@@ -44,7 +44,12 @@ test('finding 9: no workflow reads $CLAUDE_PLUGIN_ROOT; paths come in through ar
 test('finding 22: the skills start workflows with scriptPath', () => {
   for (const name of ['research', 'review']) {
     const skill = staticText(`skills/${name}/SKILL.md`)[0].text
-    assert.match(skill, /scriptPath: \$\{CLAUDE_PLUGIN_ROOT\}\/workflows\//, name)
+    // The Workflow tool refuses paths outside the project, so the skill
+    // launches a copy staged inside it, never the plugin file.
+    assert.match(skill, new RegExp(`state\\.mjs" stage-workflow ${name}`), name)
+    assert.match(skill, /scriptPath: <the path stage-workflow printed>/, name)
+    assert.doesNotMatch(skill, /scriptPath: \$\{CLAUDE_PLUGIN_ROOT\}/, name)
+    assert.match(skill, /refuses to start the script[\s\S]{0,80}\/dex:doctor/, `${name}: refused launch`)
     assert.doesNotMatch(skill, /Workflow tool, script:/, name)
     for (const key of ['stateScript', 'templatesDir', 'artifactRoot', 'stateRoot']) assert.match(skill, new RegExp(`"${key}"`), `${name}: ${key}`)
   }

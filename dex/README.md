@@ -369,6 +369,7 @@ Other invariants the scripts enforce, not the prompts:
 .dex/
 ├── config.json                  repository defaults (never overwritten)
 ├── active                       the current feature slug
+├── _workflows/                  copies of the workflow scripts, for the Workflow tool
 └── <feature-slug>/
     ├── state.json               the state machine
     └── events.jsonl             append-only audit log
@@ -390,7 +391,12 @@ The event log records decisions and hashes. It never records prompts,
 credentials, or environment contents.
 
 `init` lists `.dex/` in the repository's local ignore file (`.git/info/exclude`),
-so it never shows up in `git status` and is never committed. `/dex:pr` copies
+so it never shows up in `git status` and is never committed.
+`.dex/_workflows/` holds copies of the plugin's workflow scripts. The Workflow
+tool only loads scripts from inside the project, so `/dex:research`,
+`/dex:review` and `/dex:doctor` refresh the copies each time they run. The copies
+go in the checkout Claude Code runs in, so a session opened in a linked worktree
+gets its own `.dex/_workflows/` there. `/dex:pr` copies
 `docs/dex/<feature-slug>/` into the worktree, so the documents travel with the
 PR. `/dex:worktree` also installs a git hook at `.git/hooks/pre-push`.
 
@@ -451,6 +457,7 @@ repository: `node <dex>/scripts/state.mjs <command>`. `help` lists the commands.
 | `record-worktree <slug> <branch> <path> --base <ref>` | Record the feature worktree and pin its base commit. |
 | `install-hook` | Install the git pre-push hook. |
 | `diff-hash [slug]` | Print the base commit and tree the code approval would cover. |
+| `stage-workflow <research\|review>` | Copy a workflow into `.dex/_workflows/` and print its path, so the Workflow tool can load it. |
 | `record-pr <slug> --url <url>` | Record the pull request. |
 | `drift <slug> --target design\|structure --reason "..."` | Block the feature because the code contradicts a document. |
 | `unblock <slug>` | Clear drift by hand. Usually not needed: re-approving does it. |
