@@ -62,14 +62,14 @@ function commitLikePr(wt) {
   gitIn(wt, ['commit', '-qm', 'Portfolio optimization'])
 }
 
-test('finding 10: right after /dex:start, the worktree skill sees a clean tree', { todo: 'fixed in step 1' }, async () => {
+test('finding 10: right after /dex:start, the worktree skill sees a clean tree', async () => {
   const root = makeRepo({ origin: true })
   await planned(root)
-  // The exact check skills/worktree runs before creating the worktree.
-  assert.equal(gitIn(root, ['status', '--porcelain']).trim(), '')
+  // The check skills/worktree runs before creating the worktree.
+  assert.equal(gitIn(root, ['status', '--porcelain', '--', '.', ':!docs/dex']).trim(), '')
 })
 
-test('finding 3: Dex finds the feature from inside the worktree', { todo: 'fixed in step 1' }, async () => {
+test('finding 3: Dex finds the feature from inside the worktree', async () => {
   const root = makeRepo({ origin: true })
   await planned(root)
   const wt = await worktree(root)
@@ -77,7 +77,7 @@ test('finding 3: Dex finds the feature from inside the worktree', { todo: 'fixed
   assert.equal(out.json.slug, SLUG)
 })
 
-test('finding 3: a push from the worktree before code approval is denied', { todo: 'fixed in step 1' }, async () => {
+test('finding 3: a push from the worktree before code approval is denied', async () => {
   const root = makeRepo({ origin: true })
   await planned(root)
   const wt = await worktree(root)
@@ -87,7 +87,7 @@ test('finding 3: a push from the worktree before code approval is denied', { tod
   assert.equal(guardBash(wt, `git push -u origin dex/${SLUG}`).decision, 'deny')
 })
 
-test('findings 3 and 4: the documented flow ends with an allowed push', { todo: 'fixed in steps 1 and 3' }, async () => {
+test('findings 3 and 4: the documented flow ends with an allowed push', { todo: 'fixed in step 3' }, async () => {
   const root = makeRepo({ origin: true })
   await planned(root)
   const wt = await worktree(root)

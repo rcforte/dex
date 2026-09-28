@@ -120,16 +120,27 @@ export function isUnder(rel, dir) {
   return rel === d || rel.startsWith(d + '/')
 }
 
-/** Find the git repository root, falling back to cwd when not a repo. */
+/**
+ * Find the main checkout's root, falling back to cwd when not a repo.
+ *
+ * Dex state lives in the main checkout, but implementation happens in a linked
+ * worktree. From inside a worktree, `--show-toplevel` names the worktree, which
+ * has no `.dex/`. The common git directory is shared by every worktree, and its
+ * parent is the main checkout, so that is what this returns.
+ */
 export function findRepoRoot(startDir = process.cwd()) {
   try {
-    const out = execFileSync('git', ['rev-parse', '--show-toplevel'], {
-      cwd: startDir,
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-    })
-    const root = out.trim()
-    if (root) return root
+    const run = (args) =>
+      execFileSync('git', args, { cwd: startDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim()
+    const top = run(['rev-parse', '--show-toplevel'])
+    if (top) {
+      const common = run(['rev-parse', '--path-format=absolute', '--git-common-dir'])
+      // A normal checkout keeps its git directory at <root>/.git. Anything else
+      // (a bare repo, a custom GIT_DIR) has no main checkout to find, so the
+      // current top level is the best answer.
+      if (common && path.basename(common) === '.git') return path.dirname(common)
+      return top
+    }
   } catch {
     // Not a git repo, or git missing. Walk up looking for .dex instead.
   }
@@ -579,7 +590,6 @@ export function newFeatureState(slug, title, config) {
       completedAt: null,
     },
     worktree: {
-      required: config.requireWorktree,
       ready: false,
       branch: null,
       path: null,
@@ -691,6 +701,23 @@ export function git(args, { cwd = process.cwd(), allowFail = false, maxBuffer = 
     if (allowFail) return null
     throw new DexError(`git ${args.join(' ')} failed:\n${err.stderr || err.message}`)
   }
+}
+
+/**
+ * Keep Dex's state folder out of `git status` by listing it in the repository's
+ * local ignore file (`info/exclude`). That file is never committed, so the
+ * user's .gitignore stays untouched. Adds the line once; does nothing outside git.
+ */
+export function ignoreStateRoot(root, config) {
+  const common = git(['rev-parse', '--path-format=absolute', '--git-common-dir'], { cwd: root, allowFail: true })?.trim()
+  if (!common) return false
+  const excludePath = path.join(common, 'info', 'exclude')
+  const line = `/${config.stateRoot.replace(/^\/+|\/+$/g, '')}/`
+  const current = fs.existsSync(excludePath) ? fs.readFileSync(excludePath, 'utf8') : ''
+  if (current.split('\n').some((l) => l.trim() === line)) return false
+  fs.mkdirSync(path.dirname(excludePath), { recursive: true })
+  fs.writeFileSync(excludePath, current + (current && !current.endsWith('\n') ? '\n' : '') + line + '\n')
+  return true
 }
 
 export function isGitRepo(cwd) {

@@ -129,7 +129,7 @@ There are three kinds of test.
    - The path must appear in `git worktree list --porcelain`.
    - It must not be the main checkout.
    - Its branch must match the branch given.
-   - `--base` must resolve to a commit that is not the worktree's HEAD.
+   - `--base` must name a real commit, and must not be `HEAD` or the feature's own branch. (It may point at the same commit as the worktree when the worktree is new; that is the normal case.)
 
 ### How to test step 1
 
@@ -143,7 +143,7 @@ There are three kinds of test.
 | Dirty-tree check | Run `init`, then the exact `git status` command from the worktree skill. | Empty output. |
 | Worktree skill text | `staticText`: the worktree skill has no built-in worktree option. No skill contains `cd <worktree>`. | Both pass. |
 | `requireWorktree` read live | Run `init`. Set it to `false` and run `check`. Set it back to `true` and run `check`. | NOT-REQUIRED, then NOT-READY. |
-| `record-worktree` checks | Pass: a plain folder, the main checkout, a wrong branch name, `--base HEAD`, and then a valid worktree. | The first four are refused with a clear reason. The valid one is accepted. |
+| `record-worktree` checks | Pass: a plain folder, the main checkout, a wrong branch name, `--base HEAD`, `--base dex/<slug>`, and then a valid worktree. | The first four are refused with a clear reason. The valid one is accepted. |
 
 **Live check:** in `dex-sample`, run `/dex:start` and then `/dex:worktree`.
 - The worktree appears next to the project.

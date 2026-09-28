@@ -46,6 +46,8 @@ import {
   featureStateDir,
   findRepoRoot,
   hashFile,
+  git,
+  ignoreStateRoot,
   isGitRepo,
   listFeatures,
   loadConfig,
@@ -183,7 +185,8 @@ export function computeGates(root, config, state) {
   g.plan = { status: artifactExists(root, state, 'plan') ? GATE.COMPLETE : GATE.MISSING }
 
   const wt = state.worktree || {}
-  if (!wt.required) g.worktree = { status: GATE.NOT_REQUIRED, ready: true }
+  // Read live from config, so changing requireWorktree applies to features already in flight.
+  if (!config.requireWorktree) g.worktree = { status: GATE.NOT_REQUIRED, ready: true }
   else if (wt.ready && wt.path && fs.existsSync(wt.path)) g.worktree = { status: GATE.READY, ready: true, branch: wt.branch, path: wt.path }
   else if (wt.ready) g.worktree = { status: GATE.NOT_READY, ready: false, reason: `recorded worktree path is gone: ${wt.path}` }
   else g.worktree = { status: GATE.NOT_READY, ready: false, reason: 'no isolated worktree prepared' }
@@ -496,6 +499,7 @@ COMMANDS.init = (ctx, argv) => {
   slug = sanitizeSlug(slug)
   const { root, config } = ctx
   ensureConfig(root, config.stateRoot)
+  ignoreStateRoot(root, config)
   const statePath = path.join(featureStateDir(root, config, slug), 'state.json')
   if (fs.existsSync(statePath)) {
     const existing = loadFeatureState(root, config, slug)
@@ -550,7 +554,7 @@ COMMANDS.check = (ctx, argv) => {
     blocked: state.blocked,
     gates,
     next,
-    config: { reviewCadence: config.reviewCadence, requireWorktree: config.requireWorktree, requireAiReview: config.requireAiReview, requireHumanCodeApproval: config.requireHumanCodeApproval, strictGates: config.strictGates, maxResearchWorkers: config.maxResearchWorkers },
+    config: { artifactRoot: config.artifactRoot, reviewCadence: config.reviewCadence, requireWorktree: config.requireWorktree, requireAiReview: config.requireAiReview, requireHumanCodeApproval: config.requireHumanCodeApproval, strictGates: config.strictGates, maxResearchWorkers: config.maxResearchWorkers },
     artifacts: state.artifacts,
     worktree: state.worktree,
     warnings: config.__warnings || [],
@@ -1009,6 +1013,58 @@ COMMANDS['record-review'] = (ctx, argv) => {
   })
 }
 
+/** The repository's worktrees, main checkout first, from `git worktree list --porcelain`. */
+function listWorktrees(root) {
+  const out = git(['worktree', 'list', '--porcelain'], { cwd: root, allowFail: true }) || ''
+  return out
+    .split('\n\n')
+    .map((block) => {
+      const entry = {}
+      for (const line of block.split('\n')) {
+        const [key, ...value] = line.split(' ')
+        if (key) entry[key] = value.join(' ')
+      }
+      return entry
+    })
+    .filter((e) => e.worktree)
+}
+
+function realpath(p) {
+  try {
+    return fs.realpathSync(p)
+  } catch {
+    return path.resolve(p)
+  }
+}
+
+/** Refuse anything but a linked worktree of this repository, on the named branch. */
+function checkWorktree(root, abs, branch) {
+  const worktrees = listWorktrees(root)
+  const target = realpath(abs)
+  const index = worktrees.findIndex((w) => realpath(w.worktree) === target)
+  if (index === 0) {
+    throw new DexError(`Dex will not record ${abs} as the feature worktree because it is the main checkout.\n\nCreate a separate worktree with /dex:worktree.`)
+  }
+  if (index === -1) {
+    throw new DexError(`Dex will not record ${abs} because it is not a worktree of this repository.\n\nCreate it with: git worktree add <path> -b ${branch}`)
+  }
+  const actual = (worktrees[index].branch || '').replace(/^refs\/heads\//, '')
+  if (actual !== branch) {
+    throw new DexError(`The worktree at ${abs} is on branch "${actual || '(detached)'}", not "${branch}".\n\nRecord it with its real branch name.`)
+  }
+}
+
+/** Refuse a base that would hide the feature's own commits from the code approval. */
+function checkBase(abs, base, branch) {
+  if (!base) return
+  if (base === 'HEAD' || base === branch || base === `refs/heads/${branch}`) {
+    throw new DexError(`"${base}" cannot be the base: it is the feature branch itself, so the feature's commits would never show up in the diff.\n\nUse the branch the feature started from, such as main.`)
+  }
+  if (!git(['rev-parse', '--verify', '--quiet', `${base}^{commit}`], { cwd: abs, allowFail: true })) {
+    throw new DexError(`The base "${base}" does not name a commit in this repository.`)
+  }
+}
+
 COMMANDS['record-worktree'] = (ctx, argv) => {
   const { flags, rest } = parseFlags(argv)
   const slug = requireSlug(rest[0], 'record-worktree')
@@ -1022,13 +1078,10 @@ COMMANDS['record-worktree'] = (ctx, argv) => {
     if (!fs.existsSync(abs)) {
       throw new DexError(`Dex will not record a worktree at ${abs} because that path does not exist.\n\nCreate it first, then record it.`)
     }
-    state.worktree = {
-      required: config.requireWorktree,
-      ready: true,
-      branch,
-      path: abs,
-      base: typeof flags.base === 'string' ? flags.base : detectBaseBranch(abs) || null,
-    }
+    checkWorktree(root, abs, branch)
+    const base = typeof flags.base === 'string' ? flags.base : detectBaseBranch(abs) || null
+    checkBase(abs, base, branch)
+    state.worktree = { ready: true, branch, path: abs, base }
     const gates = refreshPhase(root, config, state)
     saveFeatureState(root, config, slug, state)
     appendEvent(root, config, slug, 'worktree_created', { branch, path: abs, base: state.worktree.base })

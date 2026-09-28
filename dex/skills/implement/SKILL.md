@@ -48,7 +48,9 @@ Repository reality  >  approved design intent  >  approved structure  >  tactica
 
 ## 4. Implement the smallest coherent change
 
-Work in the recorded worktree path.
+Work in the recorded worktree path. Do not `cd` into it: use absolute paths
+for files and `git -C <worktree>` for git, so it is always clear which checkout
+a command touches.
 
 Write code that reads like the surrounding code — its naming, its idiom, its
 comment density, its error handling conventions.

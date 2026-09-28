@@ -22,7 +22,8 @@ Do not assume a build technology. Prefer, in order:
 4. CI configuration — `.github/workflows/`, `.gitlab-ci.yml`, `Jenkinsfile`. CI is
    the most reliable statement of what "passing" means for this repository.
 
-Run in the feature's worktree path.
+Run in the feature's worktree path, using absolute paths or the tool's own
+directory option (`git -C`, `npm --prefix`, `mvn -f`), not `cd`.
 
 Categories to cover when the project has them: compile or build, unit tests,
 integration tests, lint, format check, type check, architecture tests, contract

@@ -71,7 +71,7 @@ test('an existing .dex/config.json is never overwritten', async () => {
   const config = JSON.parse(read(root, '.dex/config.json'))
   assert.equal(config.requireWorktree, false)
   assert.equal(config.reviewCadence, 'slice')
-  assert.equal(readState(root, 'feat').worktree.required, false)
+  assert.equal((await state(root, ['check', 'feat'])).json.gates.worktree.status, 'NOT-REQUIRED')
 })
 
 // ---------------------------------------------------------------------------
