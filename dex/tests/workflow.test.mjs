@@ -529,3 +529,16 @@ test('the research workflow declares a phase entry for every phase it starts', (
     assert.match(workflowSource('research.js'), new RegExp(`phase: '${title}'`), `${title} must be assigned per agent`)
   }
 })
+
+test('the worktree skill offers to continue or to let the user commit, and never commits itself', () => {
+  const skill = fs.readFileSync(path.join(PLUGIN_ROOT, 'skills', 'worktree', 'SKILL.md'), 'utf8')
+  assert.match(skill, /! cd "\$\(git rev-parse --show-toplevel\)" && git add -- '<new path>' && git commit -m '<message>' -- '<path>' '<path>'/)
+  assert.match(skill, /Use single quotes, not double quotes/)
+  assert.match(skill, /will not be\s+in the new worktree/)
+  assert.match(skill, /path in single quotes, then stop/)
+  assert.match(skill, /run\s+`\/dex:worktree <slug>` again/)
+  assert.match(skill, /Remove git's quotes and undo its escapes/)
+  assert.match(skill, /Continue without them/)
+  assert.match(skill, /Never run the commit yourself/)
+  assert.match(skill, /Do not stash, reset, check out over the changes,\s+or clean/)
+})

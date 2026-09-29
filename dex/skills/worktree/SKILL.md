@@ -32,9 +32,44 @@ git branch --show-current
 default). Dex's own files are left out of this check: the artifacts are listed
 by that pathspec, and `.dex/` is ignored locally by `init`.
 
-If there are uncommitted changes, **stop and ask**. Do not stash, reset, check
-out over them, or clean. Someone's unsaved work is not yours to discard, and a
-worktree can be created without touching it.
+If there are uncommitted changes, list them and tell the user they will not be
+in the new worktree: it starts from the last commit. Then ask which they want:
+
+- **Continue without them.** Go on to step 3. The changes stay in the main
+  checkout, untouched.
+- **Commit them first.** Print a commit for the user to run, with each listed
+  path in single quotes, then stop:
+
+  ```text
+  ! cd "$(git rev-parse --show-toplevel)" && git add -- '<new path>' && git commit -m '<message>' -- '<path>' '<path>'
+  ```
+
+  The `cd` is needed because `git status` prints paths from the repository's top
+  folder, while the command runs wherever the session started.
+
+  Use each file's real name. `git status` wraps a name that contains a space or
+  an unusual character in its own double quotes, and escapes it: `"new file.txt"`
+  means the file `new file.txt`. Remove git's quotes and undo its escapes before
+  putting the name in the command.
+
+  Use single quotes, not double quotes: inside double quotes the shell still
+  expands `$` and backticks, so a route file like `routes/users.$id.tsx` would be
+  rewritten. Inside single quotes nothing is expanded. The one exception is a `'`
+  in the name or message itself: write it as `'\''`.
+
+  After `git add`, put only the untracked paths (`??` in `git status`):
+  `git commit -- <path>` refuses a path git does not track yet. Leave out the
+  `git add … &&` part when there are none, but keep the `cd`. After `git commit --`, put every
+  listed path. For a rename, which `git status` shows as `old -> new`, that means
+  both paths.
+
+  Dex refuses `git commit` from Claude until implementation is unlocked, so the
+  user runs it. The `!` prefix runs it as the user. Once it is done, they run
+  `/dex:worktree <slug>` again.
+
+Never run the commit yourself. Do not stash, reset, check out over the changes,
+or clean. Someone's unsaved work is not yours to discard, and a worktree can be
+created without touching it.
 
 ## 3. Choose a safe branch name
 

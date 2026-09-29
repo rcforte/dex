@@ -187,3 +187,76 @@ test('finding 23: record-worktree accepts a real worktree with a proper base', a
   await state(root, ['record-worktree', 'feat', 'dex/feat', wt, '--base', 'main'])
   assert.equal((await state(root, ['check', 'feat'])).json.gates.worktree.status, 'READY')
 })
+
+/** The commit line skills/worktree prints, filled in for untracked and all changed paths. */
+function worktreeSkillCommitCommand(untracked, paths) {
+  const skill = staticText('skills/worktree/SKILL.md')[0].text
+  const line = skill.split('\n').find((l) => l.trim().startsWith('! cd '))
+  assert.ok(line, 'skills/worktree must print a ! cd ... && git add ... && git commit line')
+  // Single quotes, with a ' in a name written as '\'' — as the skill says.
+  const quote = (list) => list.map((p) => `'${p.replace(/'/g, "'\\''")}'`).join(' ')
+  return line
+    .trim()
+    .replace(/^! /, '')
+    .replace("'<new path>'", quote(untracked))
+    .replace("'<path>' '<path>'", quote(paths))
+    .replace('<message>', 'wip')
+}
+
+test('the commit line the worktree skill prints commits modified, new, deleted and renamed files', () => {
+  const root = makeRepo({ files: { 'a.txt': 'a\n', 'gone.txt': 'g\n', 'old name.txt': 'o\n' } })
+  write(root, 'a.txt', 'changed\n')
+  write(root, 'new file.txt', 'n\n')
+  fs.rmSync(path.join(root, 'gone.txt'))
+  gitIn(root, ['mv', 'old name.txt', 'new name.txt'])
+  const paths = ['a.txt', 'new file.txt', 'gone.txt', 'old name.txt', 'new name.txt']
+  execSync(worktreeSkillCommitCommand(['new file.txt'], paths), { cwd: root, stdio: 'ignore' })
+  assert.equal(gitIn(root, ['status', '--porcelain']).trim(), '')
+})
+
+test('the printed commit line also works from a subfolder of the repository', () => {
+  const root = makeRepo({ files: { 'app/x.js': 'x\n' } })
+  write(root, 'app/x.js', 'changed\n')
+  write(root, 'app/y.js', 'new\n')
+  execSync(worktreeSkillCommitCommand(['app/y.js'], ['app/x.js', 'app/y.js']), { cwd: path.join(root, 'app'), stdio: 'ignore' })
+  assert.equal(gitIn(root, ['status', '--porcelain']).trim(), '')
+})
+
+/**
+ * Paths as the worktree skill tells Claude to read them from `git status
+ * --porcelain`: git's own quotes removed and its escapes undone.
+ */
+function porcelainPaths(root) {
+  const real = (p) => (p.startsWith('"') ? JSON.parse(p) : p)
+  const untracked = []
+  const paths = []
+  for (const line of execSync('git status --porcelain', { cwd: root, encoding: 'utf8' }).split('\n').filter(Boolean)) {
+    const names = line.slice(3).split(' -> ').map(real)
+    if (line.startsWith('??')) untracked.push(...names)
+    paths.push(...names)
+  }
+  return { untracked, paths }
+}
+
+test('the printed commit line works with names read from git status, including quoted ones', () => {
+  const root = makeRepo({ files: { 'old name.txt': 'o\n', 'a.txt': 'a\n' } })
+  write(root, 'a.txt', 'changed\n')
+  write(root, 'new file.txt', 'n\n')
+  gitIn(root, ['mv', 'old name.txt', 'renamed file.txt'])
+  const { untracked, paths } = porcelainPaths(root)
+  assert.ok(execSync('git status --porcelain', { cwd: root, encoding: 'utf8' }).includes('"new file.txt"'), 'git quotes names with spaces')
+  execSync(worktreeSkillCommitCommand(untracked, paths), { cwd: root, stdio: 'ignore' })
+  assert.equal(gitIn(root, ['status', '--porcelain']).trim(), '')
+})
+
+test("the printed commit line keeps $, backticks and ' in file names intact", () => {
+  const root = makeRepo({ files: { 'routes/users.$id.tsx': 'a\n' } })
+  write(root, 'routes/users.$id.tsx', 'changed\n')
+  write(root, 'notes `x` $(date).md', 'n\n')
+  write(root, "it's.md", 'n\n')
+  const { untracked, paths } = porcelainPaths(root)
+  execSync(worktreeSkillCommitCommand(untracked, paths), { cwd: root, stdio: 'ignore' })
+  assert.equal(gitIn(root, ['status', '--porcelain']).trim(), '')
+  assert.equal(gitIn(root, ['log', '-1', '--name-only', '--format=']).trim().split('\n').sort().join('|'),
+    ["it's.md", 'notes `x` $(date).md', 'routes/users.$id.tsx'].sort().join('|'))
+})

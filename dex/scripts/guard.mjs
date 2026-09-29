@@ -361,6 +361,12 @@ export function decide({ toolName, toolInput, root, cwd = root, worktrees, confi
         `Required before implementation:\n${blockerList}\n\n` +
         `Read-only inspection (git status, git diff, git log, tests, builds) is allowed. ` +
         `So are changes inside ${config.artifactRoot}/.\n\n` +
+        // Without this, the worktree phase's Next: points back at /dex:worktree,
+        // which asks for the very commit being refused.
+        (change.what === 'git commit'
+          ? `To commit work that is not part of this feature, run the commit yourself by typing ` +
+            `\`! git commit …\` in the prompt. Dex does not check commands you run.\n\n`
+          : '') +
         footer
     )
   }

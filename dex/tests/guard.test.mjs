@@ -220,6 +220,29 @@ test('a denial explains the phase, the blockers, and the recovery command', asyn
   assert.match(r.reason, /Next:\n {2}\/dex:approve design feat/)
 })
 
+test('a refused commit tells the user to run it themselves', async () => {
+  // Plan written, no worktree yet: /dex:worktree is next, so Next: alone would loop.
+  const beforeWorktree = await ctxAt('plan')
+  for (const cmd of ['git commit -am x', 'git commit --amend', 'git -C sub commit -m x', 'git add -A && git commit -m x']) {
+    const r = verdict(beforeWorktree, bash(cmd))
+    assert.equal(r.decision, 'deny', cmd)
+    assert.match(r.reason, /! git commit/, cmd)
+  }
+  const design = await ctxAt('design')
+  const r = verdict(design, bash('git commit -am x'))
+  assert.equal(r.decision, 'deny')
+  assert.match(r.reason, /! git commit/)
+})
+
+test('only a refused commit mentions running git commit yourself', async () => {
+  const ctx = await ctxAt('design')
+  for (const cmd of ['rm -rf src', 'git merge main']) {
+    const r = verdict(ctx, bash(cmd))
+    assert.equal(r.decision, 'deny', cmd)
+    assert.doesNotMatch(r.reason, /! git commit/, cmd)
+  }
+})
+
 test('redirect targets are classified by destination, not by command', async () => {
   const ctx = await ctxAt('design')
   const ok = { root: ctx.root, artifactRoot: 'docs/dex', stateRoot: '.dex' }

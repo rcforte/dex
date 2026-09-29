@@ -4,6 +4,17 @@ All notable changes to the Dex plugin.
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] — 2026-09-28
+
+### Fixed
+
+- **Uncommitted changes no longer trap you at `/dex:worktree`.** It used to stop
+  and ask, but Dex refuses Claude's `git commit` before implementation, so
+  "commit them" could not be done from Claude. The skill now offers two choices:
+  continue without the changes, or commit them yourself with a printed
+  `! git commit` line. The guard's refusal of `git commit` now names that line
+  too. No guard decision changed.
+
 ## [0.2.1] — 2026-09-28
 
 ### Fixed
