@@ -66,6 +66,10 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/state.mjs" set-slices <slug> "S1:<name>" "S2
 Ids and names must match the plan. Include the word "tracer" in the name of a
 tracer checkpoint so state records it as one.
 
+If a revised structure is approved after implementation has started, run
+`set-slices` again with the full list. Started checkpoints keep their records
+and cannot be dropped.
+
 ## 4. Stop
 
 Print:

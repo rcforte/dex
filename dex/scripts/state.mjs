@@ -910,6 +910,12 @@ COMMANDS['set-slices'] = (ctx, argv) => {
           `Checkpoints come from the approved structure.\n\nRun:\n  /dex:approve structure ${slug}`
       )
     }
+    if (state.pr?.created) {
+      throw new DexError(
+        `Dex will not change the checkpoints of "${slug}": its PR is recorded, so the feature is complete.\n\n` +
+          `Start a new feature for further work:\n  /dex:start`
+      )
+    }
     const existing = new Map((state.slices || []).map((s) => [s.id, s]))
     const slices = specs.map((spec) => {
       const idx = spec.indexOf(':')
@@ -935,15 +941,32 @@ COMMANDS['set-slices'] = (ctx, argv) => {
     if (dupes.length) throw new DexError(`Duplicate checkpoint ids: ${[...new Set(dupes)].join(', ')}`)
     const oldIds = [...existing.keys()].sort()
     const newIds = slices.map((s) => s.id).sort()
-    const started = [...existing.values()].filter((s) => s.status !== 'pending').map((s) => s.id)
-    if (started.length && oldIds.join() !== newIds.join()) {
+    // Once work has started, the list changes only after the human approves a
+    // revised structure: an approval newer than the latest checkpoint start.
+    const started = [...existing.values()].filter((s) => s.startedAt).map((s) => s.id)
+    const latestStart = [...existing.values()].map((s) => s.startedAt).filter(Boolean).sort().at(-1)
+    const approvedAt = gates.structure.approved ? gates.structure.approvedAt : null
+    const unlocked = !latestStart || (approvedAt && approvedAt > latestStart)
+    if (!unlocked && oldIds.join() !== newIds.join()) {
       throw new DexError(
-        `Dex will not change the checkpoints of "${slug}": ${started.join(', ')} already started.\n\n` +
+        `Dex will not change the checkpoints of "${slug}": ${started.join(', ')} already started, ` +
+          `and the structure has not been approved since.\n\n` +
           `Recorded: ${oldIds.join(', ')}\nRequested: ${newIds.join(', ')}\n\n` +
-          `If the structure really changed, that is design drift:\n  node state.mjs drift ${slug} --target structure --reason "..."`
+          `To change them:\n` +
+          `  1. Revise ${state.artifacts.structure} with the new checkpoints.\n` +
+          `  2. Ask the user to approve it: /dex:approve structure ${slug}\n` +
+          `  3. Run set-slices again with the full list.\n\n` +
+          `If the code contradicted the design, record that first:\n  node state.mjs drift ${slug} --target structure --reason "..."`
       )
     }
     const dropped = oldIds.filter((id) => !newIds.includes(id))
+    const droppedStarted = dropped.filter((id) => started.includes(id))
+    if (droppedStarted.length) {
+      throw new DexError(
+        `Dex will not drop ${droppedStarted.join(', ')}: already started, and the record stays.\n\n` +
+          `Keep ${droppedStarted.join(', ')} in the list, even if the revised structure no longer needs it.`
+      )
+    }
     if (dropped.length && !flags.replace) {
       throw new DexError(
         `This would drop recorded checkpoint(s) ${dropped.join(', ')}.\n\n` +

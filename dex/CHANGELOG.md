@@ -4,6 +4,19 @@ All notable changes to the Dex plugin.
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.3] — 2026-09-28
+
+### Fixed
+
+- **A checkpoint added mid-implementation can now be recorded.** Once any
+  checkpoint had started, `set-slices` refused every new one. Its advice to
+  record design drift led back to the same refusal. Now the list can change
+  after the user approves a revised structure, as long as that approval is
+  newer than the latest checkpoint start. Started checkpoints are never
+  dropped, even with `--replace`. A checkpoint blocked before it started no
+  longer locks the list. `set-slices` is refused once the PR is recorded. The
+  implement and plan skills describe the route for new work found by review.
+
 ## [0.2.2] — 2026-09-28
 
 ### Fixed

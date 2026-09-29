@@ -450,7 +450,7 @@ repository: `node <dex>/scripts/state.mjs <command>`. `help` lists the commands.
 | `status [slug]`, `check [slug]`, `next [slug]` | The gate board, the gate report as JSON, the next command. |
 | `approve <gate> <slug>` | Record an approval. Refused when the model runs it. |
 | `transition <slug> <event>` | Log a stage event. Opens no gate. |
-| `set-slices <slug> "S1:name" ...` | Record the checkpoints. `--replace` allows dropping recorded ones before any has started. |
+| `set-slices <slug> "S1:name" ...` | Record the checkpoints. `--replace` allows dropping pending ones. Once one has started, the list changes only after the structure is approved again, and started ones are never dropped. |
 | `start-slice`, `finish-slice`, `block-slice` | Move one checkpoint through its states. |
 | `verification <slug> pass\|fail\|reset` | Record test results with their exit codes. |
 | `record-review <slug> pass\|remediation-required` | Record the AI review conclusion. |

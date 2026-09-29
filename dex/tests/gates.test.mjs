@@ -270,6 +270,126 @@ test('finding 21: set-slices cannot change the checkpoints once one has started'
   assert.equal(readState(root, 'feat').slices[0].status, 'in-progress')
 })
 
+/** Revise the structure and have the human approve it again, as after drift or a review fix. */
+function reapproveStructure(root) {
+  write(root, `${D}/05-structure.md`, '# Program Structure\n\nTracer bullet required: NO\n\nRevised: adds S3.\n')
+  runPromptHook('/dex:approve structure feat', root)
+}
+
+const ids = (root) => readState(root, 'feat').slices.map((s) => s.id)
+
+test('a structure approved after work started lets a new checkpoint be recorded', async () => {
+  const { root } = await readyToImplement()
+  await state(root, ['start-slice', 'feat', 'S1'])
+  const before = readState(root, 'feat').slices[0]
+  reapproveStructure(root)
+  await state(root, ['set-slices', 'feat', 'S1:tracer — end to end', 'S2:happy path', 'S3:review fix'])
+  const [s1, , s3] = readState(root, 'feat').slices
+  assert.equal(s3.status, 'pending')
+  assert.equal(s1.status, 'in-progress')
+  assert.equal(s1.startedAt, before.startedAt)
+})
+
+test('after re-approval a new checkpoint can go before a pending one', async () => {
+  const { root } = await readyToImplement()
+  await state(root, ['start-slice', 'feat', 'S1'])
+  reapproveStructure(root)
+  await state(root, ['set-slices', 'feat', 'S1:a', 'S3:fix first', 'S2:b'])
+  assert.deepEqual(ids(root), ['S1', 'S3', 'S2'])
+})
+
+test('a started checkpoint is never dropped, even after re-approval and with --replace', async () => {
+  const { root } = await readyToImplement()
+  await state(root, ['start-slice', 'feat', 'S1'])
+  reapproveStructure(root)
+  const msg = await stateFails(root, ['set-slices', 'feat', 'S2:b', '--replace'])
+  assert.match(msg, /S1/)
+  assert.match(msg, /started/)
+  assert.deepEqual(ids(root), ['S1', 'S2'])
+})
+
+test('after re-approval a pending checkpoint can still be dropped with --replace', async () => {
+  const { root } = await readyToImplement()
+  await state(root, ['start-slice', 'feat', 'S1'])
+  reapproveStructure(root)
+  await state(root, ['set-slices', 'feat', 'S1:a', '--replace'])
+  assert.deepEqual(ids(root), ['S1'])
+})
+
+test('a checkpoint started after the re-approval locks the list again', async () => {
+  const { root } = await readyToImplement()
+  await state(root, ['start-slice', 'feat', 'S1'])
+  reapproveStructure(root)
+  await state(root, ['start-slice', 'feat', 'S2'])
+  assert.match(await stateFails(root, ['set-slices', 'feat', 'S1:a', 'S2:b', 'S3:c']), /started/)
+})
+
+test('a checkpoint started and then blocked still locks the list and is never dropped', async () => {
+  const { root } = await readyToImplement()
+  await state(root, ['start-slice', 'feat', 'S1'])
+  await state(root, ['block-slice', 'feat', 'S1', '--reason', 'waiting on a decision'])
+  assert.match(await stateFails(root, ['set-slices', 'feat', 'S1:a', 'S2:b', 'S3:c']), /started/)
+  reapproveStructure(root)
+  assert.match(await stateFails(root, ['set-slices', 'feat', 'S2:b', '--replace']), /S1/)
+  assert.deepEqual(ids(root), ['S1', 'S2'])
+})
+
+test('a structure approval that went stale does not unlock the list, even without strictGates', async () => {
+  const root = makeRepo()
+  write(root, '.dex/config.json', JSON.stringify({ schemaVersion: 1, strictGates: false }))
+  await advanceTo(root, 'feat', 'worktree')
+  await state(root, ['start-slice', 'feat', 'S1'])
+  reapproveStructure(root)
+  write(root, `${D}/05-structure.md`, '# Program Structure\n\nTracer bullet required: NO\n\nEdited again, not approved.\n')
+  assert.match(await stateFails(root, ['set-slices', 'feat', 'S1:a', 'S2:b', 'S3:c']), /not been approved since/)
+  assert.deepEqual(ids(root), ['S1', 'S2'])
+})
+
+test('a checkpoint blocked before it ever started does not lock the list', async () => {
+  const { root } = await readyToImplement()
+  await state(root, ['block-slice', 'feat', 'S2', '--reason', 'waiting on a decision'])
+  await state(root, ['set-slices', 'feat', 'S1:a', 'S2:b', 'S3:c'])
+  assert.deepEqual(ids(root), ['S1', 'S2', 'S3'])
+})
+
+test('the refusal names the steps that let the list change', async () => {
+  const { root } = await readyToImplement()
+  await state(root, ['start-slice', 'feat', 'S1'])
+  const msg = await stateFails(root, ['set-slices', 'feat', 'S1:a', 'S2:b', 'S3:c'])
+  assert.match(msg, /05-structure\.md/)
+  assert.match(msg, /\/dex:approve structure feat/)
+  assert.match(msg, /set-slices/)
+})
+
+test('a review fix after every checkpoint finished is recorded and worked like any other', async () => {
+  const { root, worktree } = await readyToImplement()
+  await completeImplementation(root, 'feat', worktree)
+  await state(root, ['drift', 'feat', '--target', 'structure', '--reason', 'review found a defect'])
+  reapproveStructure(root)
+  assert.equal((await check(root)).blocked, null)
+
+  const [s1Before] = readState(root, 'feat').slices
+  await state(root, ['set-slices', 'feat', 'S1:tracer — end to end', 'S2:happy path', 'S3:review fix'])
+  assert.deepEqual(readState(root, 'feat').slices[0], s1Before, 'a finished checkpoint keeps its record')
+  let json = await check(root)
+  assert.notEqual(json.gates.implementation.status, 'COMPLETE')
+  assert.equal(json.gates.canPr.allowed, false)
+  assert.equal(json.next.command, '/dex:implement feat S3')
+
+  await state(root, ['start-slice', 'feat', 'S3'])
+  await state(root, ['finish-slice', 'feat', 'S3', '--verification', 'mvn -q test'])
+  json = await check(root)
+  assert.equal(json.gates.implementation.status, 'COMPLETE')
+})
+
+test('set-slices is refused once the PR is recorded', async () => {
+  const { root } = await readyToPublish()
+  await state(root, ['record-pr', 'feat'])
+  reapproveStructure(root)
+  assert.match(await stateFails(root, ['set-slices', 'feat', 'S1:a', 'S2:b', 'S3:c']), /complete/)
+  assert.deepEqual(ids(root), ['S1', 'S2'])
+})
+
 test('finding 21: checkpoint ids are normalised, so S01 and S1 are the same checkpoint', async () => {
   const { root } = await readyToImplement()
   assert.match(await stateFails(root, ['set-slices', 'feat', 'S01:a', 'S1:b', 'S2:c']), /Duplicate/)

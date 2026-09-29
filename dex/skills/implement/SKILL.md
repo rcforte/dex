@@ -107,6 +107,24 @@ approves it again with `/dex:approve`. Dex then unblocks the feature by itself.
 That is correct. Silently improvising a materially different architecture is how a
 feature ends up as something nobody approved.
 
+### New work the structure does not have
+
+Review or verification can find work that needs its own checkpoint, even though
+the design still holds. Do not do it outside Dex's state. Instead:
+
+1. Add the checkpoint to `05-structure.md`.
+2. Ask the user to approve it: `/dex:approve structure <slug>`.
+3. Record the full list again, started checkpoints included:
+
+   ```bash
+   node "${CLAUDE_PLUGIN_ROOT}/scripts/state.mjs" set-slices <slug> "S1:<name>" "S2:<name>" "S3:<new>"
+   ```
+
+4. Implement it with `start-slice` as usual.
+
+Dex refuses to change the list until that approval is newer than the latest
+checkpoint start. Started checkpoints can never be dropped.
+
 ## 7. Record the result
 
 Append to `07-implementation-log.md` using
